@@ -349,12 +349,16 @@ where
     /// client has separate timeout parameters that apply, like
     /// `delivery.timeout.ms`.
     ///
+    /// If `force_flush` is true, the method will flush rdkafkas internal queue
+    /// after the batch is enqueued, ignoring the delay imposed by `linger.ms`.
+    ///
     /// See also the [`FutureProducer::send_result`] method, which will not
     /// retry the queue operation if the queue is full.
     pub async fn send_batch<K, P, T>(
         &self,
         records: Vec<FutureRecord<'_, K, P>>,
         queue_timeout: T,
+        force_flush: bool,
     ) -> Vec<OwnedDeliveryResult>
     where
         K: ToBytes + ?Sized,
@@ -369,7 +373,7 @@ where
             _ => false,
         };
 
-        let mut rxs = Vec::new();
+        let mut rxs = Vec::with_capacity(records.len());
         let mut enqueue_err = None;
 
         for record in records {
@@ -413,6 +417,12 @@ where
             if enqueue_err.is_some() {
                 break;
             }
+        }
+
+        if force_flush {
+            // Trigger a non-blocking flush.
+            // Any errors will be collected below, so we know if any msg was actually sent.
+            let _ = self.producer.flush(Timeout::After(Duration::default()));
         }
 
         // our assumption is that the producer respects ordering, we check the rx
