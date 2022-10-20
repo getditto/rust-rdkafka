@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 
 /// Overall statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Statistics {
     /// The name of the librdkafka handle.
     pub name: String,
@@ -29,16 +29,18 @@ pub struct Statistics {
     pub ts: i64,
     /// Wall clock time, in seconds since the Unix epoch.
     pub time: i64,
+    /// Time since this client instance was created, in microseconds.
+    pub age: i64,
     /// The number of operations (callbacks, events, etc.) waiting in queue.
     pub replyq: i64,
     /// The current number of messages in producer queues.
-    pub msg_cnt: i64,
+    pub msg_cnt: u64,
     /// The current total size of messages in producer queues.
-    pub msg_size: i64,
+    pub msg_size: u64,
     /// The maximum number of messages allowed in the producer queues.
-    pub msg_max: i64,
+    pub msg_max: u64,
     /// The maximum total size of messages allowed in the producer queues.
-    pub msg_size_max: i64,
+    pub msg_size_max: u64,
     /// The total number of requests sent to brokers.
     pub tx: i64,
     /// The total number of bytes transmitted to brokers.
@@ -71,7 +73,7 @@ pub struct Statistics {
 }
 
 /// Per-broker statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Broker {
     /// The broker hostname, port, and ID, in the form `HOSTNAME:PORT/ID`.
     pub name: String,
@@ -97,38 +99,44 @@ pub struct Broker {
     /// response.
     pub waitresp_msg_cnt: i64,
     /// The total number of requests sent to the broker.
-    pub tx: i64,
+    pub tx: u64,
     /// The total number of bytes sent to the broker.
-    pub txbytes: i64,
+    pub txbytes: u64,
     /// The total number of transmission errors.
-    pub txerrs: i64,
+    pub txerrs: u64,
     /// The total number of request retries.
-    pub txretries: i64,
+    pub txretries: u64,
+    /// Microseconds since last socket send, or -1 if no sends yet for the
+    /// current connection.
+    pub txidle: i64,
     /// The total number of requests that timed out.
-    pub req_timeouts: i64,
+    pub req_timeouts: u64,
     /// The total number of responses received from the broker.
-    pub rx: i64,
+    pub rx: u64,
     /// The total number of bytes received from the broker.
-    pub rxbytes: i64,
+    pub rxbytes: u64,
     /// The total number of receive errors.
-    pub rxerrs: i64,
+    pub rxerrs: u64,
     /// The number of unmatched correlation IDs in response, typically for
     /// timed out requests.
-    pub rxcorriderrs: i64,
+    pub rxcorriderrs: u64,
     /// The total number of partial message sets received. The broker may return
     /// partial responses if the full message set could not fit in the remaining
     /// fetch response size.
-    pub rxpartial: i64,
+    pub rxpartial: u64,
+    /// Microseconds since last socket receive, or -1 if no receives yet for the
+    /// current connection.
+    pub rxidle: i64,
     /// Request type counters. The object key is the name of the request type
     /// and the value is the number of requests of that type that have been
     /// sent.
     pub req: HashMap<String, i64>,
     /// The total number of decompression buffer size increases.
-    pub zbuf_grow: i64,
+    pub zbuf_grow: u64,
     /// The total number of buffer size increases (deprecated and unused).
-    pub buf_grow: i64,
+    pub buf_grow: u64,
     /// The number of broker thread poll wakeups.
-    pub wakeups: Option<i64>,
+    pub wakeups: Option<u64>,
     /// The number of connection attempts, including successful and failed
     /// attempts, and name resolution failures.
     pub connects: Option<i64>,
@@ -160,7 +168,7 @@ pub struct Broker {
 ///
 /// These values are not exact; they are sampled estimates maintained by an
 /// HDR histogram in librdkafka.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Window {
     /// The smallest value.
     pub min: i64,
@@ -194,7 +202,7 @@ pub struct Window {
 }
 
 /// A topic and partition specifier.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct TopicPartition {
     /// The name of the topic.
     pub topic: String,
@@ -203,7 +211,7 @@ pub struct TopicPartition {
 }
 
 /// Per-topic statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Topic {
     /// The name of the topic.
     pub topic: String,
@@ -218,7 +226,7 @@ pub struct Topic {
 }
 
 /// Per-partition statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct Partition {
     /// The partition ID.
     pub partition: i32,
@@ -233,15 +241,15 @@ pub struct Partition {
     /// The number of messages waiting to be produced in the first-level queue.
     pub msgq_cnt: i64,
     /// The number of bytes waiting to be produced in the first-level queue.
-    pub msgq_bytes: i64,
+    pub msgq_bytes: u64,
     /// The number of messages ready to be produced in the transmit queue.
     pub xmit_msgq_cnt: i64,
     /// The number of bytes ready to be produced in the transmit queue.
-    pub xmit_msgq_bytes: i64,
+    pub xmit_msgq_bytes: u64,
     /// The number of prefetched messages in the fetch queue.
     pub fetchq_cnt: i64,
     /// The number of bytes in the fetch queue.
-    pub fetchq_size: i64,
+    pub fetchq_size: u64,
     /// The consumer fetch state for this partition (none, stopping, stopped,
     /// offset-query, offset-wait, active).
     pub fetch_state: String,
@@ -263,22 +271,23 @@ pub struct Partition {
     pub hi_offset: i64,
     /// The last stable offset on the broker.
     pub ls_offset: i64,
-    /// The difference between `hi_offset` and `max(app_offset,
-    /// committed_offset)`.
+    /// The difference between `hi_offset` and `committed_offset`.
     pub consumer_lag: i64,
+    /// The difference between `hi_offset` and `stored_offset`.
+    pub consumer_lag_stored: i64,
     /// The total number of messages transmitted (produced).
-    pub txmsgs: i64,
+    pub txmsgs: u64,
     /// The total number of bytes transmitted (produced).
-    pub txbytes: i64,
+    pub txbytes: u64,
     /// The total number of messages consumed, not included ignored messages.
-    pub rxmsgs: i64,
+    pub rxmsgs: u64,
     /// The total bytes consumed.
-    pub rxbytes: i64,
+    pub rxbytes: u64,
     /// The total number of messages received, for consumers, or the total
     /// number of messages produced, for producers.
-    pub msgs: i64,
+    pub msgs: u64,
     /// The number of dropped outdated messages.
-    pub rx_ver_drops: i64,
+    pub rx_ver_drops: u64,
     /// The current number of messages in flight to or from the broker.
     pub msgs_inflight: i64,
     /// The next expected acked sequence number, for idempotent producers.
@@ -286,11 +295,11 @@ pub struct Partition {
     /// The next expected errored sequence number, for idempotent producers.
     pub next_err_seq: i64,
     /// The last acked internal message ID, for idempotent producers.
-    pub acked_msgid: i64,
+    pub acked_msgid: u64,
 }
 
 /// Consumer group manager statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct ConsumerGroup {
     /// The local consumer group handler's state.
     pub state: String,
@@ -312,7 +321,7 @@ pub struct ConsumerGroup {
 }
 
 /// Exactly-once semantics statistics.
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Default)]
 pub struct ExactlyOnceSemantics {
     /// The current idempotent producer state.
     pub idemp_state: String,
@@ -389,6 +398,7 @@ mod tests {
         "type": "producer",
         "ts": 1163982743268,
         "time": 1589652530,
+        "age": 5,
         "replyq": 0,
         "msg_cnt": 320,
         "msg_size": 9920,
@@ -412,12 +422,14 @@ mod tests {
             "txbytes": 463869957,
             "txerrs": 0,
             "txretries": 0,
+            "txidle": 5,
             "req_timeouts": 0,
             "rx": 31310,
             "rxbytes": 1753668,
             "rxerrs": 0,
             "rxcorriderrs": 0,
             "rxpartial": 0,
+            "rxidle": 5,
             "zbuf_grow": 0,
             "buf_grow": 0,
             "wakeups": 131568,
@@ -578,6 +590,7 @@ mod tests {
                 "hi_offset": -1001,
                 "ls_offset": -1001,
                 "consumer_lag": -1,
+                "consumer_lag_stored": 0,
                 "txmsgs": 3950967,
                 "txbytes": 122479977,
                 "rxmsgs": 0,
@@ -613,6 +626,7 @@ mod tests {
                 "hi_offset": -1001,
                 "ls_offset": -1001,
                 "consumer_lag": -1,
+                "consumer_lag_stored": 0,
                 "txmsgs": 3950656,
                 "txbytes": 122470336,
                 "rxmsgs": 0,
@@ -648,6 +662,7 @@ mod tests {
                 "hi_offset": -1001,
                 "ls_offset": -1001,
                 "consumer_lag": -1,
+                "consumer_lag_stored": 0,
                 "txmsgs": 3952027,
                 "txbytes": 122512837,
                 "rxmsgs": 0,
@@ -683,6 +698,7 @@ mod tests {
                 "hi_offset": -1001,
                 "ls_offset": -1001,
                 "consumer_lag": -1,
+                "consumer_lag_stored": 0,
                 "txmsgs": 0,
                 "txbytes": 0,
                 "rxmsgs": 0,

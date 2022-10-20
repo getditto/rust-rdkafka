@@ -2,8 +2,97 @@
 
 See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
 
-<a name="0.26.1"></a>
-## 0.26.1 (Unreleased)
+## 0.28.0 (2021-11-27)
+
+* Add the `StreamConsumer::split_partition_queue` method to mirror
+  `BaseConsumer::split_partition_queue` ([#411]).
+
+  Thanks to [@davidblewett], [@duarten], and [@nemosupremo] for contributing to
+  the implementation.
+
+* **Breaking change.** Remove the `StreamConsumerContext` type and the
+  `ConsumerContext::message_queue_nonempty_callback` method. These were
+  essentially implementation details of `StreamConsumer` that had leaked into
+  the public API. The vast majority of users should be unaffected.
+
+* **Breaking change.** Remove the type parameters from the `MessageStream` type.
+
+* **Breaking change.** Add the received `TopicPartitionList` to the
+  `Rebalance::Revoke` variant, which is useful when using incremental
+  cooperative rebalancing ([#398]).
+
+* Avoid crashing if librdkafka invokes the commit callback with a null
+  topic partition list ([#406]).
+
+  Thanks, [@thijsc].
+
+* Add the new statistics fields in librdkafka v1.7.0 to the various statistics
+  types. The new fields are:
+
+    * `Partition::consumer_lag_stored`
+    * `Broker::txidle`
+    * `Broker::rxidle`
+    * `Statistics::age`
+
+* **Breaking change.** Change the type of the following statistics fields from
+  `i64` to `u64` to reflect the signedness of the upstream types:
+
+    * `Statistics::msg_cnt`
+    * `Statistics::msg_size`
+    * `Statistics::msg_max`
+    * `Statistics::msg_size_max`
+    * `Broker::tx`
+    * `Broker::txbytes`
+    * `Broker::txretries`
+    * `Broker::req_timeouts`
+    * `Broker::rx`
+    * `Broker::rxbytes`
+    * `Broker::rxerrs`
+    * `Broker::rxcorriderrs`
+    * `Broker::rxpartial`
+    * `Broker::zbuf_grow`
+    * `Broker::buf_grow`
+    * `Broker::wakeups`
+    * `Broker::msgq_bytes`
+    * `Broker::xmit_msgq_bytes`
+    * `Broker::fetchq_size`
+    * `Partition::txmsgs`
+    * `Partition::txbytes`
+    * `Partition::rxmsgs`
+    * `Partition::rxbytes`
+    * `Partition::msgs`
+    * `Partition::rx_ver_drops`
+    * `Partition::acked_msgid`
+
+* Add the `ClientContext::stats_raw` method to consume the JSON-encoded
+  statistics from librdkafka. The default implementation calls
+  `ClientContext::stats` with the decoded statistics.
+
+* Add the `Default` trait to the statistics types: `Statistics`, `Broker`,
+  `Window`, `TopicPartition`, `Topic`, `Partition`, `ConsumerGroup`, and
+  `ExactlyOnceSemantics` ([#410]).
+
+  Thanks, [@scanterog].
+
+* Add the `Debug` trait to `DefaultClientContext` and `DefaultConsumerContext`
+  ([#401]).
+
+  Thanks, [@DXist].
+
+[#398]: https://github.com/fede1024/rust-rdkafka/issues/398
+[#401]: https://github.com/fede1024/rust-rdkafka/issues/401
+[#406]: https://github.com/fede1024/rust-rdkafka/issues/406
+[#410]: https://github.com/fede1024/rust-rdkafka/issues/410
+[#411]: https://github.com/fede1024/rust-rdkafka/issues/411
+[@davidblewett]: https://github.com/davidblewett
+[@duarten]: https://github.com/duarten
+[@DXist]: https://github.com/DXist
+[@nemosupremo]: https://github.com/nemosupremo
+[@scanterog]: https://github.com/scanterog
+[@thijsc]: https://github.com/thijsc
+
+<a name="0.27.0"></a>
+## 0.27.0 (2021-10-17)
 
 * Allow offset 0 in `Offset::to_raw`.
 
@@ -18,7 +107,49 @@ See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
   `Consumer::store_offset_from_message`.
 
 [#89]: https://github.com/fede1024/rust-rdkafka/issues/89
+
+* Provide a mutable accessor (`Message::payload_mut`) for a message's
+  payload ([#95]).
+
+* Implement `std::iter::Extend<(String, String)>` and
+  `std::iter::FromIterator<(String, String)` for `ClientConfig` ([#367]).
+
+  Thanks, [@djKooks].
+
+* **Breaking change.** Change `Consumer::store_offset` to accept the topic,
+  partition, and offset directly ([#89], [#368]). The old API, which took a
+  `BorrowedMessage`, is still accessible as
+  `Consumer::store_offset_from_message`.
+
+* Support incremental cooperative rebalancing ([#364]). There are two changes
+  of note:
+
+    * The addition of `Consumer::rebalance_protocol` to determine the rebalance
+      protocol in use.
+
+    * The modification of the default rebalance callback
+      (`ConsumerContext::rebalance`) to perform incremental assignments and
+      unassignments when the rebalance protocol in use is
+      [`RebalanceProtocol::Cooperative`].
+
+  Thanks, [@SreeniIO].
+
+* Support reading and writing commit metadata via
+  `TopicPartitionListElem::metadata` and `TopicPartitionListElem::set_metadata`,
+  respectively ([#391]).
+
+  Thanks, [@phaazon].
+
+[#89]: https://github.com/fede1024/rust-rdkafka/issues/89
+[#95]: https://github.com/fede1024/rust-rdkafka/issues/95
 [#360]: https://github.com/fede1024/rust-rdkafka/issues/360
+[#364]: https://github.com/fede1024/rust-rdkafka/issues/364
+[#367]: https://github.com/fede1024/rust-rdkafka/issues/367
+[#368]: https://github.com/fede1024/rust-rdkafka/issues/368
+[#391]: https://github.com/fede1024/rust-rdkafka/issues/391
+[@djKooks]: https://github.com/djKooks
+[@phaazon]: https://github.com/phaazon
+[@SreeniIO]: https://github.com/SreeniIO
 
 <a name="0.26.0"></a>
 ## 0.26.0 (2021-03-16)

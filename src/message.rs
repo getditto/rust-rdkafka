@@ -27,8 +27,8 @@ pub enum Timestamp {
 
 impl Timestamp {
     /// Convert the timestamp to milliseconds since epoch.
-    pub fn to_millis(&self) -> Option<i64> {
-        match *self {
+    pub fn to_millis(self) -> Option<i64> {
+        match self {
             Timestamp::NotAvailable | Timestamp::CreateTime(-1) | Timestamp::LogAppendTime(-1) => {
                 None
             }
@@ -96,6 +96,16 @@ pub trait Message {
 
     /// Returns the payload of the message, or `None` if there is no payload.
     fn payload(&self) -> Option<&[u8]>;
+
+    /// Returns a mutable reference to the payload of the message, or `None` if
+    /// there is no payload.
+    ///
+    ///
+    /// # Safety
+    ///
+    /// librdkafka does not formally guarantee that modifying the payload is
+    /// safe. Calling this method may therefore result in undefined behavior.
+    unsafe fn payload_mut(&mut self) -> Option<&mut [u8]>;
 
     /// Returns the source topic of the message.
     fn topic(&self) -> &str;
@@ -319,6 +329,10 @@ impl<'a> Message for BorrowedMessage<'a> {
         unsafe { util::ptr_to_opt_slice((*self.ptr).payload, (*self.ptr).len) }
     }
 
+    unsafe fn payload_mut(&mut self) -> Option<&mut [u8]> {
+        util::ptr_to_opt_mut_slice((*self.ptr).payload, (*self.ptr).len)
+    }
+
     fn topic(&self) -> &str {
         unsafe {
             CStr::from_ptr(rdsys::rd_kafka_topic_name((*self.ptr).rkt))
@@ -516,10 +530,11 @@ impl Message for OwnedMessage {
     }
 
     fn payload(&self) -> Option<&[u8]> {
-        match self.payload {
-            Some(ref p) => Some(p.as_slice()),
-            None => None,
-        }
+        self.payload.as_deref()
+    }
+
+    unsafe fn payload_mut(&mut self) -> Option<&mut [u8]> {
+        self.payload.as_deref_mut()
     }
 
     fn topic(&self) -> &str {
@@ -547,7 +562,7 @@ impl Message for OwnedMessage {
 ///
 /// If message production is successful `DeliveryResult` will contain the sent
 /// message, which can be used to find which partition and offset the message
-/// was sent to. If message production is not successful, the `DeliveryReport`
+/// was sent to. If message production is not successful, the `DeliveryResult`
 /// will contain an error and the message that failed to be sent. The partition
 /// and offset, in this case, will default to -1 and 0 respectively.
 ///

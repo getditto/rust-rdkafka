@@ -31,8 +31,8 @@ pub use self::stream_consumer::{MessageStream, StreamConsumer};
 pub enum Rebalance<'a> {
     /// A new partition assignment is received.
     Assign(&'a TopicPartitionList),
-    /// All partitions are revoked.
-    Revoke,
+    /// A new partition revocation is received.
+    Revoke(&'a TopicPartitionList),
     /// Unexpected error from Kafka.
     Error(String),
 }
@@ -58,7 +58,7 @@ pub trait ConsumerContext: ClientContext {
     ) {
         let rebalance = match err {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => Rebalance::Assign(tpl),
-            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => Rebalance::Revoke,
+            RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => Rebalance::Revoke(tpl),
             _ => {
                 let error = unsafe { cstr_to_owned(rdsys::rd_kafka_err2str(err)) };
                 error!("Error rebalancing: {}", error);
@@ -74,12 +74,23 @@ pub trait ConsumerContext: ClientContext {
         unsafe {
             match err {
                 RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => {
-                    rdsys::rd_kafka_assign(native_client.ptr(), tpl.ptr());
+                    match native_client.rebalance_protocol() {
+                        RebalanceProtocol::Cooperative => {
+                            rdsys::rd_kafka_incremental_assign(native_client.ptr(), tpl.ptr());
+                        }
+                        _ => {
+                            rdsys::rd_kafka_assign(native_client.ptr(), tpl.ptr());
+                        }
+                    }
                 }
-                _ => {
-                    // Also for RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS
-                    rdsys::rd_kafka_assign(native_client.ptr(), ptr::null());
-                }
+                _ => match native_client.rebalance_protocol() {
+                    RebalanceProtocol::Cooperative => {
+                        rdsys::rd_kafka_incremental_unassign(native_client.ptr(), tpl.ptr());
+                    }
+                    _ => {
+                        rdsys::rd_kafka_assign(native_client.ptr(), ptr::null());
+                    }
+                },
             }
         }
         trace!("Running post-rebalance with {:?}", rebalance);
@@ -119,18 +130,11 @@ pub trait ConsumerContext: ClientContext {
     fn main_queue_min_poll_interval(&self) -> Timeout {
         Timeout::After(Duration::from_secs(1))
     }
-
-    /// Message queue nonempty callback. This method will run when the
-    /// consumer's message queue switches from empty to nonempty.
-    fn message_queue_nonempty_callback(&self) {}
-
-    // NOTE: when adding a new method, remember to add it to the
-    // StreamConsumerContext as well.
 }
 
 /// An inert [`ConsumerContext`] that can be used when no customizations are
 /// needed.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DefaultConsumerContext;
 
 impl ClientContext for DefaultConsumerContext {}
@@ -166,6 +170,16 @@ unsafe impl KafkaDrop for RDKafkaConsumerGroupMetadata {
 
 unsafe impl Send for ConsumerGroupMetadata {}
 unsafe impl Sync for ConsumerGroupMetadata {}
+
+/// The rebalance protocol for a consumer.
+pub enum RebalanceProtocol {
+    /// The consumer has not (yet) joined a group.
+    None,
+    /// Eager rebalance protocol.
+    Eager,
+    /// Cooperative rebalance protocol.
+    Cooperative,
+}
 
 /// Common trait for all consumers.
 ///
@@ -325,4 +339,7 @@ where
 
     /// Resumes consumption for the provided list of partitions.
     fn resume(&self, partitions: &TopicPartitionList) -> KafkaResult<()>;
+
+    /// Reports the rebalance protocol in use.
+    fn rebalance_protocol(&self) -> RebalanceProtocol;
 }

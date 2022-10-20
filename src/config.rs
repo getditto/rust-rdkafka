@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::mem;
+use std::iter::FromIterator;
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -102,15 +102,6 @@ impl NativeClientConfig {
     /// Returns the pointer to the librdkafka RDKafkaConf structure.
     pub fn ptr(&self) -> *mut RDKafkaConf {
         self.ptr.ptr()
-    }
-
-    /// Returns the pointer to the librdkafka RDKafkaConf structure. This method should be used when
-    /// the native pointer is intended to be moved. The destructor won't be executed automatically;
-    /// the caller should take care of deallocating the resource when no longer needed.
-    pub fn ptr_move(self) -> *mut RDKafkaConf {
-        let ptr = self.ptr();
-        mem::forget(self);
-        ptr
     }
 
     /// Gets the value of a parameter in the configuration.
@@ -273,6 +264,26 @@ impl ClientConfig {
     }
 }
 
+impl FromIterator<(String, String)> for ClientConfig {
+    fn from_iter<I>(iter: I) -> ClientConfig
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut config = ClientConfig::new();
+        config.extend(iter);
+        config
+    }
+}
+
+impl Extend<(String, String)> for ClientConfig {
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        self.conf_map.extend(iter)
+    }
+}
+
 /// Return the log level
 fn log_level_from_global_config() -> RDKafkaLogLevel {
     if log_enabled!(target: "librdkafka", Level::Debug) {
@@ -297,4 +308,21 @@ pub trait FromClientConfig: Sized {
 pub trait FromClientConfigAndContext<C: ClientContext>: Sized {
     /// Creates a client from a client configuration and a client context.
     fn from_config_and_context(_: &ClientConfig, _: C) -> KafkaResult<Self>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClientConfig;
+
+    #[test]
+    fn test_client_config_set_map() {
+        let mut config: ClientConfig = vec![("a".into(), "1".into()), ("b".into(), "1".into())]
+            .into_iter()
+            .collect();
+        config.extend([("b".into(), "2".into()), ("c".into(), "3".into())]);
+
+        assert_eq!(config.get("a").unwrap(), "1");
+        assert_eq!(config.get("b").unwrap(), "2");
+        assert_eq!(config.get("c").unwrap(), "3");
+    }
 }

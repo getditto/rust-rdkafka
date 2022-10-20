@@ -2,7 +2,7 @@
 
 use std::cmp;
 use std::ffi::CString;
-use std::mem;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use crate::config::{
 };
 use crate::consumer::{
     CommitMode, Consumer, ConsumerContext, ConsumerGroupMetadata, DefaultConsumerContext,
+    RebalanceProtocol,
 };
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::groups::GroupList;
@@ -38,10 +39,13 @@ pub(crate) unsafe extern "C" fn native_commit_cb<C: ConsumerContext>(
     } else {
         Ok(())
     };
-    let tpl = TopicPartitionList::from_ptr(offsets);
-    context.commit_callback(commit_error, &tpl);
-
-    mem::forget(tpl); // Do not free offsets
+    if offsets.is_null() {
+        let tpl = TopicPartitionList::new();
+        context.commit_callback(commit_error, &tpl);
+    } else {
+        let tpl = ManuallyDrop::new(TopicPartitionList::from_ptr(offsets));
+        context.commit_callback(commit_error, &tpl);
+    }
 }
 
 /// Native rebalance callback. This callback will run on every rebalance, and it will call the
@@ -53,32 +57,9 @@ unsafe extern "C" fn native_rebalance_cb<C: ConsumerContext>(
     opaque_ptr: *mut c_void,
 ) {
     let context = &mut *(opaque_ptr as *mut C);
-    let native_client = NativeClient::from_ptr(rk);
-    let mut tpl = TopicPartitionList::from_ptr(native_tpl);
-
+    let native_client = ManuallyDrop::new(NativeClient::from_ptr(rk));
+    let mut tpl = ManuallyDrop::new(TopicPartitionList::from_ptr(native_tpl));
     context.rebalance(&native_client, err, &mut tpl);
-
-    mem::forget(native_client); // Do not free native client
-    mem::forget(tpl); // Do not free native topic partition list
-}
-
-/// Native message queue nonempty callback. This callback will run whenever the
-/// consumer's message queue switches from empty to nonempty.
-unsafe extern "C" fn native_message_queue_nonempty_cb<C: ConsumerContext>(
-    _: *mut RDKafka,
-    opaque_ptr: *mut c_void,
-) {
-    let context = &mut *(opaque_ptr as *mut C);
-
-    (*context).message_queue_nonempty_callback();
-}
-
-unsafe fn enable_nonempty_callback<C: ConsumerContext>(queue: &NativeQueue, context: &Arc<C>) {
-    rdsys::rd_kafka_queue_cb_event_enable(
-        queue.ptr(),
-        Some(native_message_queue_nonempty_cb::<C>),
-        Arc::as_ptr(context) as *mut c_void,
-    )
 }
 
 /// A low-level consumer that requires manual polling.
@@ -91,7 +72,6 @@ where
 {
     client: Client<C>,
     main_queue_min_poll_interval: Timeout,
-    _queue: Option<NativeQueue>,
 }
 
 impl FromClientConfig for BaseConsumer {
@@ -133,16 +113,9 @@ where
             RDKafkaType::RD_KAFKA_CONSUMER,
             context,
         )?;
-        let queue = client.consumer_queue();
-        if let Some(queue) = &queue {
-            unsafe {
-                enable_nonempty_callback(queue, client.context());
-            }
-        }
         Ok(BaseConsumer {
             client,
             main_queue_min_poll_interval,
-            _queue: queue,
         })
     }
 
@@ -269,10 +242,7 @@ where
             ))
         };
         queue.map(|queue| {
-            unsafe {
-                enable_nonempty_callback(&queue, self.client.context());
-                rdsys::rd_kafka_queue_forward(queue.ptr(), ptr::null_mut());
-            }
+            unsafe { rdsys::rd_kafka_queue_forward(queue.ptr(), ptr::null_mut()) }
             PartitionQueue::new(self.clone(), queue)
         })
     }
@@ -566,6 +536,10 @@ where
         };
         Ok(())
     }
+
+    fn rebalance_protocol(&self) -> RebalanceProtocol {
+        self.client.native_client().rebalance_protocol()
+    }
 }
 
 impl<C> Drop for BaseConsumer<C>
@@ -619,15 +593,15 @@ pub struct PartitionQueue<C>
 where
     C: ConsumerContext,
 {
-    consumer: Arc<BaseConsumer<C>>,
-    queue: NativeQueue,
+    pub(crate) consumer: Arc<BaseConsumer<C>>,
+    pub(crate) queue: NativeQueue,
 }
 
 impl<C> PartitionQueue<C>
 where
     C: ConsumerContext,
 {
-    fn new(consumer: Arc<BaseConsumer<C>>, queue: NativeQueue) -> Self {
+    pub(crate) fn new(consumer: Arc<BaseConsumer<C>>, queue: NativeQueue) -> Self {
         PartitionQueue { consumer, queue }
     }
 

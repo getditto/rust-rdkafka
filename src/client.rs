@@ -13,6 +13,7 @@
 
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
+use std::mem::ManuallyDrop;
 use std::os::raw::c_char;
 use std::os::raw::c_void;
 use std::ptr;
@@ -26,6 +27,7 @@ use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
 use crate::config::{ClientConfig, NativeClientConfig, RDKafkaLogLevel};
+use crate::consumer::RebalanceProtocol;
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::groups::GroupList;
 use crate::metadata::Metadata;
@@ -76,12 +78,25 @@ pub trait ClientContext: Send + Sync {
         }
     }
 
-    /// Receives the statistics of the librdkafka client. To enable, the
+    /// Receives the decoded statistics of the librdkafka client. To enable, the
     /// `statistics.interval.ms` configuration parameter must be specified.
     ///
     /// The default implementation logs the statistics at the `info` log level.
     fn stats(&self, statistics: Statistics) {
         info!("Client stats: {:?}", statistics);
+    }
+
+    /// Receives the JSON-encoded statistics of the librdkafka client. To
+    /// enable, the `statistics.interval.ms` configuration parameter must be
+    /// specified.
+    ///
+    /// The default implementation calls [`ClientContext::stats`] with the
+    /// decoded statistics, logging an error if the decoding fails.
+    fn stats_raw(&self, statistics: &[u8]) {
+        match serde_json::from_slice(&statistics) {
+            Ok(stats) => self.stats(stats),
+            Err(e) => error!("Could not parse statistics JSON: {}", e),
+        }
     }
 
     /// Receives global errors from the librdkafka client.
@@ -92,15 +107,16 @@ pub trait ClientContext: Send + Sync {
     }
 
     // NOTE: when adding a new method, remember to add it to the
-    // StreamConsumerContext and FutureProducerContext as well.
-    // https://github.com/rust-lang/rfcs/pull/1406 will maybe help in the future.
+    // FutureProducerContext as well.
+    // https://github.com/rust-lang/rfcs/pull/1406 will maybe help in the
+    // future.
 }
 
 /// An empty [`ClientContext`] that can be used when no customizations are
 /// needed.
 ///
 /// Uses the default callback implementations provided by `ClientContext`.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct DefaultClientContext;
 
 impl ClientContext for DefaultClientContext {}
@@ -136,6 +152,16 @@ impl NativeClient {
     /// Returns the wrapped pointer to RDKafka.
     pub fn ptr(&self) -> *mut RDKafka {
         self.ptr.ptr()
+    }
+
+    pub(crate) fn rebalance_protocol(&self) -> RebalanceProtocol {
+        let protocol = unsafe { CStr::from_ptr(rdsys::rd_kafka_rebalance_protocol(self.ptr())) };
+        match protocol.to_bytes() {
+            b"NONE" => RebalanceProtocol::None,
+            b"EAGER" => RebalanceProtocol::Eager,
+            b"COOPERATIVE" => RebalanceProtocol::Cooperative,
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -180,9 +206,10 @@ impl<C: ClientContext> Client<C> {
         };
 
         let client_ptr = unsafe {
+            let native_config = ManuallyDrop::new(native_config);
             rdsys::rd_kafka_new(
                 rd_kafka_type,
-                native_config.ptr_move(),
+                native_config.ptr(),
                 err_buf.as_mut_ptr(),
                 err_buf.capacity(),
             )
@@ -398,18 +425,7 @@ pub(crate) unsafe extern "C" fn native_stats_cb<C: ClientContext>(
     opaque: *mut c_void,
 ) -> i32 {
     let context = &mut *(opaque as *mut C);
-
-    let mut bytes_vec = Vec::new();
-    bytes_vec.extend_from_slice(slice::from_raw_parts(json as *mut u8, json_len));
-    let json_string = CString::from_vec_unchecked(bytes_vec).into_string();
-    match json_string {
-        Ok(json) => match serde_json::from_str(&json) {
-            Ok(stats) => context.stats(stats),
-            Err(e) => error!("Could not parse statistics JSON: {}", e),
-        },
-        Err(e) => error!("Statistics JSON string is not UTF-8: {:?}", e),
-    }
-
+    context.stats_raw(slice::from_raw_parts(json as *mut u8, json_len));
     0 // librdkafka will free the json buffer
 }
 
