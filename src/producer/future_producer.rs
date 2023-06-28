@@ -383,6 +383,7 @@ where
 
         let mut rxs = Vec::with_capacity(records.len());
         let mut enqueue_err = None;
+        let mut logged = false;
 
         for record in records {
             let (tx, rx) = oneshot::channel();
@@ -396,7 +397,11 @@ where
                             && can_retry() =>
                     {
                         base_record = record;
-                        R::delay_for(Duration::from_millis(100)).await;
+                        if !logged {
+                            logged = true;
+                            self.context().log(RDKafkaLogLevel::Warning, "FutrueProducer::send_batch", "QueueFull");
+                        }
+                        R::delay_for(Duration::from_millis(1)).await;
                     }
                     Ok(_) => {
                         rxs.push(rx);
@@ -436,7 +441,7 @@ where
         // our assumption is that the producer respects ordering, we check the rx
         // channels in order, the first that fails means (we hope!) the all the
         // following also fail. The best we can do is a prefix of successful awaits.
-        let mut results = Vec::new();
+        let mut results = Vec::with_capacity(rxs.len() + enqueue_err.is_some() as usize);
         for rx in rxs {
             match rx.await.expect("producer unexpectedly dropped") {
                 Ok((p, o)) => results.push(Ok((p, o))),
