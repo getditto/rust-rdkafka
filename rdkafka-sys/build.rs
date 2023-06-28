@@ -137,6 +137,7 @@ fn build_librdkafka() {
             cflags.push(format!("-I{}/include", curl_root));
         }
     } else {
+        // There's also no disable-curl????
         configure_flags.push("--disable-curl".into());
     }
 

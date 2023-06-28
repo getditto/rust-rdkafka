@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "rdkafka"
-version = "0.32.2"
+version = "0.32.2+ditto"
 dependencies = [
  "async-std",
  "backoff",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "rdkafka-sys"
-version = "4.5.0+1.9.2"
+version = "4.5.0+ditto.2.2.0"
 dependencies = [
  "cmake",
  "curl-sys",
