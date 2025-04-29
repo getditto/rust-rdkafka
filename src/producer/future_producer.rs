@@ -420,11 +420,7 @@ where
                         base_record = record;
                         if !logged {
                             logged = true;
-                            self.context().log(
-                                RDKafkaLogLevel::Warning,
-                                "FutrueProducer::send_batch",
-                                "QueueFull",
-                            );
+                            self.context().log(RDKafkaLogLevel::Warning, "FutrueProducer::send_batch", "QueueFull");
                         }
                         R::delay_for(Duration::from_millis(1)).await;
                     }
@@ -469,7 +465,7 @@ where
         let mut results = Vec::with_capacity(rxs.len() + enqueue_err.is_some() as usize);
         for rx in rxs {
             match rx.await.expect("producer unexpectedly dropped") {
-                Ok(d) => results.push(Ok(d)),
+                Ok((p, o)) => results.push(Ok((p, o))),
                 Err((e, om)) => {
                     results.push(Err((e, om)));
                     break;
