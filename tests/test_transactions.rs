@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::time::Duration;
 
+use log::info;
 use maplit::hashmap;
 
 use rdkafka::config::ClientConfig;
@@ -20,16 +22,18 @@ mod utils;
 fn create_consumer(
     config_overrides: Option<HashMap<&str, &str>>,
 ) -> Result<BaseConsumer, KafkaError> {
+    configure_logging_for_tests();
     consumer_config(&rand_test_group(), config_overrides).create()
 }
 
 fn create_producer() -> Result<BaseProducer, KafkaError> {
+    configure_logging_for_tests();
     let mut config = ClientConfig::new();
     config
-        .set("bootstrap.servers", &get_bootstrap_server())
+        .set("bootstrap.servers", get_bootstrap_server())
         .set("message.timeout.ms", "5000")
         .set("enable.idempotence", "true")
-        .set("transactional.id", &rand_test_transactional_id())
+        .set("transactional.id", rand_test_transactional_id())
         .set("debug", "eos");
     config.set_log_level(RDKafkaLogLevel::Debug);
     config.create()
@@ -64,8 +68,8 @@ fn count_records(topic: &str, iso: IsolationLevel) -> Result<usize, KafkaError> 
 
 #[tokio::test]
 async fn test_transaction_abort() -> Result<(), Box<dyn Error>> {
-    let consume_topic = rand_test_topic();
-    let produce_topic = rand_test_topic();
+    let consume_topic = rand_test_topic("test_transaction_abort");
+    let produce_topic = rand_test_topic("test_transaction_abort");
 
     populate_topic(&consume_topic, 30, &value_fn, &key_fn, Some(0), None).await;
 
@@ -103,8 +107,11 @@ async fn test_transaction_abort() -> Result<(), Box<dyn Error>> {
     }
 
     // Abort the transaction, but only after producing all messages.
-    producer.flush(Timeout::Never)?;
-    producer.abort_transaction(Timeout::Never)?;
+    info!("BEFORE FLUSH");
+    producer.flush(Duration::from_secs(20))?;
+    info!("AFTER FLUSH");
+    producer.abort_transaction(Duration::from_secs(20))?;
+    info!("AFTER ABORT");
 
     // Check that no records were produced in read committed mode, but that
     // the records are visible in read uncommitted mode.
@@ -132,8 +139,8 @@ async fn test_transaction_abort() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test]
 async fn test_transaction_commit() -> Result<(), Box<dyn Error>> {
-    let consume_topic = rand_test_topic();
-    let produce_topic = rand_test_topic();
+    let consume_topic = rand_test_topic("test_transaction_commit");
+    let produce_topic = rand_test_topic("test_transaction_commit");
 
     populate_topic(&consume_topic, 30, &value_fn, &key_fn, Some(0), None).await;
 

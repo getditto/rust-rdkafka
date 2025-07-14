@@ -5,6 +5,8 @@ use std::error::Error;
 use std::ffi::CStr;
 use std::fmt;
 
+use num_enum::IntoPrimitive;
+
 use crate::bindings;
 use crate::helpers;
 
@@ -70,8 +72,14 @@ pub type RDKafkaNewTopic = bindings::rd_kafka_NewTopic_t;
 /// Native rdkafka delete topic object.
 pub type RDKafkaDeleteTopic = bindings::rd_kafka_DeleteTopic_t;
 
+/// Native rdkafka delete group object.
+pub type RDKafkaDeleteGroup = bindings::rd_kafka_DeleteGroup_t;
+
 /// Native rdkafka new partitions object.
 pub type RDKafkaNewPartitions = bindings::rd_kafka_NewPartitions_t;
+
+/// Native rdkafka delete records object.
+pub type RDKafkaDeleteRecords = bindings::rd_kafka_DeleteRecords_t;
 
 /// Native rdkafka config resource.
 pub type RDKafkaConfigResource = bindings::rd_kafka_ConfigResource_t;
@@ -84,6 +92,12 @@ pub type RDKafkaAdminOptions = bindings::rd_kafka_AdminOptions_t;
 
 /// Native rdkafka topic result.
 pub type RDKafkaTopicResult = bindings::rd_kafka_topic_result_t;
+
+/// Native rdkafka group result.
+pub type RDKafkaGroupResult = bindings::rd_kafka_group_result_t;
+
+/// Native rdkafka mock cluster.
+pub type RDKafkaMockCluster = bindings::rd_kafka_mock_cluster_t;
 
 // ENUMS
 
@@ -233,6 +247,12 @@ pub enum RDKafkaErrorCode {
     Noop = -141,
     /// No offset to automatically reset to.
     AutoOffsetReset = -140,
+    /// Partition log truncation detected
+    LogTruncation = -139,
+    /// A different record in the batch was invalid and this message failed persisting.
+    InvalidDifferentRecord = -138,
+    /// Broker is going away but client isn't terminating */
+    DestroyBroker = -137,
     #[doc(hidden)]
     End = -100,
     /// Unknown broker error.
@@ -440,6 +460,25 @@ pub enum RDKafkaErrorCode {
     FeatureUpdateFailed = 96,
     /// Request principal deserialization failed during forwarding.
     PrincipalDeserializationFailure = 97,
+    /// Unknown Topic Id
+    UnknownTopicId = 100,
+    /// The member epoch is fenced by the group coordinator
+    FencedMemberEpoch = 110,
+    /// The instance ID is still used by another member in the consumer group
+    UnreleasedInstanceId = 111,
+    /// The assignor or its version range is not supported by the consumer group
+    UnsupportedAssignor = 112,
+    /// The member epoch is stale
+    StaleMemberEpoch = 113,
+    /// Client sent a push telemetry request with an invalid or outdated
+    /// subscription ID.
+    UnknownSubscriptionId = 117,
+    /// Client sent a push telemetry request larger than the maximum size
+    /// the broker will accept.
+    TelemetryTooLarge = 118,
+    /// Client metadata is stale,
+    /// client should rebootstrap to obtain new metadata.
+    RebootstrapRequired = 129,
     #[doc(hidden)]
     EndAll,
 }
@@ -467,6 +506,72 @@ impl fmt::Display for RDKafkaErrorCode {
 }
 
 impl Error for RDKafkaErrorCode {}
+
+/// Native rdkafka ApiKeys / protocol requests
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntoPrimitive)]
+#[repr(i16)]
+#[non_exhaustive]
+pub enum RDKafkaApiKey {
+    Produce = 0,
+    Fetch = 1,
+    ListOffsets = 2,
+    Metadata = 3,
+    LeaderAndIsr = 4,
+    StopReplica = 5,
+    UpdateMetadata = 6,
+    ControlledShutdown = 7,
+    OffsetCommit = 8,
+    OffsetFetch = 9,
+    FindCoordinator = 10,
+    JoinGroup = 11,
+    Heartbeat = 12,
+    LeaveGroup = 13,
+    SyncGroup = 14,
+    DescribeGroups = 15,
+    ListGroups = 16,
+    SaslHandshake = 17,
+    ApiVersion = 18,
+    CreateTopics = 19,
+    DeleteTopics = 20,
+    DeleteRecords = 21,
+    InitProducerId = 22,
+    OffsetForLeaderEpoch = 23,
+    AddPartitionsToTxn = 24,
+    AddOffsetsToTxn = 25,
+    EndTxn = 26,
+    WriteTxnMarkers = 27,
+    TxnOffsetCommit = 28,
+    DescribeAcls = 29,
+    CreateAcls = 30,
+    DeleteAcls = 31,
+    DescribeConfigs = 32,
+    AlterConfigs = 33,
+    AlterReplicaLogDirs = 34,
+    DescribeLogDirs = 35,
+    SaslAuthenticate = 36,
+    CreatePartitions = 37,
+    CreateDelegationToken = 38,
+    RenewDelegationToken = 39,
+    ExpireDelegationToken = 40,
+    DescribeDelegationToken = 41,
+    DeleteGroups = 42,
+    ElectLeaders = 43,
+    IncrementalAlterConfigs = 44,
+    AlterPartitionReassignments = 45,
+    ListPartitionReassignments = 46,
+    OffsetDelete = 47,
+    DescribeClientQuotas = 48,
+    AlterClientQuotas = 49,
+    DescribeUserScramCredentials = 50,
+    AlterUserScramCredentials = 51,
+    Vote = 52,
+    BeginQuorumEpoch = 53,
+    EndQuorumEpoch = 54,
+    DescribeQuorum = 55,
+    AlterIsr = 56,
+    UpdateFeatures = 57,
+    Envelope = 58,
+}
 
 #[cfg(test)]
 mod tests {

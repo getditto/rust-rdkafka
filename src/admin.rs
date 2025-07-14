@@ -26,6 +26,7 @@ use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::log::{trace, warn};
 use crate::util::{cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout};
+use crate::TopicPartitionList;
 
 //
 // ********** ADMIN CLIENT **********
@@ -131,6 +132,46 @@ impl<C: ClientContext> AdminClient<C> {
         Ok(rx)
     }
 
+    /// Deletes the named groups.
+    pub fn delete_groups(
+        &self,
+        group_names: &[&str],
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<GroupResult>>> {
+        match self.delete_groups_inner(group_names, opts) {
+            Ok(rx) => Either::Left(DeleteGroupsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn delete_groups_inner(
+        &self,
+        group_names: &[&str],
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let mut native_groups = Vec::new();
+        let mut err_buf = ErrBuf::new();
+        for gn in group_names {
+            let gn_t = CString::new(*gn)?;
+            let native_group = unsafe {
+                NativeDeleteGroup::from_ptr(rdsys::rd_kafka_DeleteGroup_new(gn_t.as_ptr())).unwrap()
+            };
+            native_groups.push(native_group);
+        }
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+
+        unsafe {
+            rdsys::rd_kafka_DeleteGroups(
+                self.client.native_ptr(),
+                native_groups.as_c_array(),
+                native_groups.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            )
+        }
+        Ok(rx)
+    }
+
     /// Adds additional partitions to existing topics according to the provided
     /// `NewPartitions` specifications.
     ///
@@ -171,6 +212,53 @@ impl<C: ClientContext> AdminClient<C> {
                 self.client.native_ptr(),
                 native_partitions.as_c_array(),
                 native_partitions.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            );
+        }
+        Ok(rx)
+    }
+
+    /// Deletes records from a topic.
+    ///
+    /// The provided `offsets` is a topic partition list specifying which
+    /// records to delete from a list of topic partitions. For each entry in the
+    /// list, the messages at offsets before the specified offsets (exclusive)
+    /// in the specified partition will be deleted. Use offset [`crate::Offset::End`]
+    /// to delete all records in the partition.
+    ///
+    /// Returns a topic partition list describing the result of the deletion. If
+    /// the operation succeeded for a partition, the offset for that partition
+    /// will be set to the post-deletion low-water mark for that partition. If
+    /// the operation failed for a partition, there will be an error for that
+    /// partition's entry in the list.
+    pub fn delete_records(
+        &self,
+        offsets: &TopicPartitionList,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<TopicPartitionList>> {
+        match self.delete_records_inner(offsets, opts) {
+            Ok(rx) => Either::Left(DeleteRecordsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn delete_records_inner(
+        &self,
+        offsets: &TopicPartitionList,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>> {
+        let mut err_buf = ErrBuf::new();
+        let delete_records = unsafe {
+            NativeDeleteRecords::from_ptr(rdsys::rd_kafka_DeleteRecords_new(offsets.ptr()))
+        }
+        .ok_or_else(|| KafkaError::AdminOpCreation(err_buf.to_string()))?;
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        unsafe {
+            rdsys::rd_kafka_DeleteRecords(
+                self.client.native_ptr(),
+                &mut delete_records.ptr(),
+                1,
                 native_opts.ptr(),
                 self.queue.ptr(),
             );
@@ -243,7 +331,8 @@ impl<C: ClientContext> AdminClient<C> {
         Ok(rx)
     }
 
-    /// Sets configuration parameters for the specified resources.
+    /// Sets configuration parameters for the specified resources,
+    /// resetting unspecified parameters to their default values.
     ///
     /// Note that while the API supports altering multiple resources at once, it
     /// is not transactional. Alteration of some resources may succeed while
@@ -363,7 +452,7 @@ fn start_poll_thread(queue: Arc<NativeQueue>, should_stop: Arc<AtomicBool>) -> J
         .expect("Failed to start polling thread")
 }
 
-type NativeEvent = NativePtr<RDKafkaEvent>;
+pub(crate) type NativeEvent = NativePtr<RDKafkaEvent>;
 
 unsafe impl KafkaDrop for RDKafkaEvent {
     const TYPE: &'static str = "event";
@@ -561,6 +650,27 @@ fn build_topic_results(topics: *const *const RDKafkaTopicResult, n: usize) -> Ve
     out
 }
 
+/// The result of a DeleteGroup operation.
+pub type GroupResult = Result<String, (String, RDKafkaErrorCode)>;
+
+fn build_group_results(groups: *const *const RDKafkaGroupResult, n: usize) -> Vec<GroupResult> {
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let group = unsafe { *groups.add(i) };
+        let name = unsafe { cstr_to_owned(rdsys::rd_kafka_group_result_name(group)) };
+        let err = unsafe {
+            let err = rdsys::rd_kafka_group_result_error(group);
+            rdsys::rd_kafka_error_code(err)
+        };
+        if err.is_error() {
+            out.push(Err((name, err.into())));
+        } else {
+            out.push(Ok(name));
+        }
+    }
+    out
+}
+
 //
 // Create topic handling
 //
@@ -741,6 +851,41 @@ impl Future for DeleteTopicsFuture {
 }
 
 //
+// Delete group handling
+//
+
+type NativeDeleteGroup = NativePtr<RDKafkaDeleteGroup>;
+
+unsafe impl KafkaDrop for RDKafkaDeleteGroup {
+    const TYPE: &'static str = "delete group";
+    const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_DeleteGroup_destroy;
+}
+
+struct DeleteGroupsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DeleteGroupsFuture {
+    type Output = KafkaResult<Vec<GroupResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DeleteGroups_result(event.ptr()) };
+        if res.is_null() {
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "delete groups request received response of incorrect type ({})",
+                typ
+            ))));
+        }
+        let mut n = 0;
+        let groups = unsafe { rdsys::rd_kafka_DeleteGroups_result_groups(res, &mut n) };
+        Poll::Ready(Ok(build_group_results(groups, n)))
+    }
+}
+
+//
 // Create partitions handling
 //
 
@@ -766,7 +911,7 @@ impl<'a> NewPartitions<'a> {
 
     /// Sets the partition replica assignment for the new partitions. Only
     /// assignments for newly created replicas should be included.
-    pub fn assign(mut self, assignment: PartitionAssignment<'a>) -> NewPartitions<'_> {
+    pub fn assign(mut self, assignment: PartitionAssignment<'a>) -> NewPartitions<'a> {
         self.assignment = Some(assignment);
         self
     }
@@ -851,6 +996,43 @@ impl Future for CreatePartitionsFuture {
         let mut n = 0;
         let topics = unsafe { rdsys::rd_kafka_CreatePartitions_result_topics(res, &mut n) };
         Poll::Ready(Ok(build_topic_results(topics, n)))
+    }
+}
+
+//
+// Delete records handling
+//
+
+type NativeDeleteRecords = NativePtr<RDKafkaDeleteRecords>;
+
+unsafe impl KafkaDrop for RDKafkaDeleteRecords {
+    const TYPE: &'static str = "delete records";
+    const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_DeleteRecords_destroy;
+}
+
+struct DeleteRecordsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for DeleteRecordsFuture {
+    type Output = KafkaResult<TopicPartitionList>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        let res = unsafe { rdsys::rd_kafka_event_DeleteRecords_result(event.ptr()) };
+        if res.is_null() {
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "delete records request received response of incorrect type ({})",
+                typ
+            ))));
+        }
+        let tpl = unsafe {
+            let tpl = rdsys::rd_kafka_DeleteRecords_result_offsets(res);
+            TopicPartitionList::from_ptr(rdsys::rd_kafka_topic_partition_list_copy(tpl))
+        };
+        Poll::Ready(Ok(tpl))
     }
 }
 

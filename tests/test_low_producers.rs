@@ -5,6 +5,7 @@ use std::error::Error;
 use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::thread;
 use std::time::Duration;
 
 use maplit::hashmap;
@@ -13,7 +14,8 @@ use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders, OwnedMessage};
 use rdkafka::producer::{
-    BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer,
+    BaseProducer, BaseRecord, DeliveryResult, NoCustomPartitioner, Partitioner, Producer,
+    ProducerContext, ThreadedProducer,
 };
 use rdkafka::types::RDKafkaRespErr;
 use rdkafka::util::current_time_millis;
@@ -46,9 +48,10 @@ impl ProducerContext for PrintingContext {
 type TestProducerDeliveryResult = (OwnedMessage, Option<KafkaError>, usize);
 
 #[derive(Clone)]
-struct CollectingContext {
+struct CollectingContext<Part: Partitioner = NoCustomPartitioner> {
     stats: Arc<Mutex<Vec<Statistics>>>,
     results: Arc<Mutex<Vec<TestProducerDeliveryResult>>>,
+    partitioner: Option<Part>,
 }
 
 impl CollectingContext {
@@ -56,11 +59,22 @@ impl CollectingContext {
         CollectingContext {
             stats: Arc::new(Mutex::new(Vec::new())),
             results: Arc::new(Mutex::new(Vec::new())),
+            partitioner: None,
         }
     }
 }
 
-impl ClientContext for CollectingContext {
+impl<Part: Partitioner> CollectingContext<Part> {
+    fn new_with_custom_partitioner(partitioner: Part) -> CollectingContext<Part> {
+        CollectingContext {
+            stats: Arc::new(Mutex::new(Vec::new())),
+            results: Arc::new(Mutex::new(Vec::new())),
+            partitioner: Some(partitioner),
+        }
+    }
+}
+
+impl<Part: Partitioner + Send + Sync> ClientContext for CollectingContext<Part> {
     // Access and use all stats.
     fn stats(&self, stats: Statistics) {
         let mut stats_vec = self.stats.lock().unwrap();
@@ -68,7 +82,7 @@ impl ClientContext for CollectingContext {
     }
 }
 
-impl ProducerContext for CollectingContext {
+impl<Part: Partitioner + Send + Sync> ProducerContext<Part> for CollectingContext<Part> {
     type DeliveryOpaque = usize;
 
     fn delivery(&self, delivery_result: &DeliveryResult, delivery_opaque: Self::DeliveryOpaque) {
@@ -80,12 +94,58 @@ impl ProducerContext for CollectingContext {
             }
         }
     }
+
+    fn get_custom_partitioner(&self) -> Option<&Part> {
+        match &self.partitioner {
+            None => None,
+            Some(p) => Some(p),
+        }
+    }
+}
+
+// Partitioner sending all messages to single, defined partition.
+#[derive(Clone)]
+pub struct FixedPartitioner {
+    partition: i32,
+}
+
+impl FixedPartitioner {
+    fn new(partition: i32) -> Self {
+        Self { partition }
+    }
+}
+
+impl Partitioner for FixedPartitioner {
+    fn partition(
+        &self,
+        _topic_name: &str,
+        _key: Option<&[u8]>,
+        _partition_cnt: i32,
+        _is_paritition_available: impl Fn(i32) -> bool,
+    ) -> i32 {
+        self.partition
+    }
+}
+
+#[derive(Clone)]
+pub struct PanicPartitioner {}
+
+impl Partitioner for PanicPartitioner {
+    fn partition(
+        &self,
+        _topic_name: &str,
+        _key: Option<&[u8]>,
+        _partition_cnt: i32,
+        _is_paritition_available: impl Fn(i32) -> bool,
+    ) -> i32 {
+        panic!("partition() panic");
+    }
 }
 
 fn default_config(config_overrides: HashMap<&str, &str>) -> ClientConfig {
     let mut config = ClientConfig::new();
     config
-        .set("bootstrap.servers", &get_bootstrap_server())
+        .set("bootstrap.servers", get_bootstrap_server())
         .set("message.timeout.ms", "5000");
 
     for (key, value) in config_overrides {
@@ -98,26 +158,34 @@ fn base_producer(config_overrides: HashMap<&str, &str>) -> BaseProducer<Printing
     base_producer_with_context(PrintingContext { _n: 123 }, config_overrides)
 }
 
-fn base_producer_with_context<C: ProducerContext>(
+fn base_producer_with_context<Part: Partitioner, C: ProducerContext<Part>>(
     context: C,
     config_overrides: HashMap<&str, &str>,
-) -> BaseProducer<C> {
+) -> BaseProducer<C, Part> {
+    configure_logging_for_tests();
     default_config(config_overrides)
-        .create_with_context::<C, BaseProducer<_>>(context)
+        .create_with_context::<C, BaseProducer<_, Part>>(context)
         .unwrap()
 }
 
 #[allow(dead_code)]
-fn threaded_producer(config_overrides: HashMap<&str, &str>) -> ThreadedProducer<PrintingContext> {
+fn threaded_producer(
+    config_overrides: HashMap<&str, &str>,
+) -> ThreadedProducer<PrintingContext, NoCustomPartitioner> {
     threaded_producer_with_context(PrintingContext { _n: 123 }, config_overrides)
 }
 
-fn threaded_producer_with_context<C: ProducerContext>(
+fn threaded_producer_with_context<Part, C>(
     context: C,
     config_overrides: HashMap<&str, &str>,
-) -> ThreadedProducer<C> {
+) -> ThreadedProducer<C, Part>
+where
+    Part: Partitioner + Send + Sync + 'static,
+    C: ProducerContext<Part>,
+{
+    configure_logging_for_tests();
     default_config(config_overrides)
-        .create_with_context::<C, ThreadedProducer<_>>(context)
+        .create_with_context::<C, ThreadedProducer<_, _>>(context)
         .unwrap()
 }
 
@@ -126,7 +194,7 @@ fn threaded_producer_with_context<C: ProducerContext>(
 #[test]
 fn test_base_producer_queue_full() {
     let producer = base_producer(hashmap! { "queue.buffering.max.messages" => "10" });
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_base_producer_queue_full");
 
     let results = (0..30)
         .map(|id| {
@@ -145,11 +213,13 @@ fn test_base_producer_queue_full() {
     let errors = results
         .iter()
         .filter(|&e| {
-            if let &Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), _)) = e {
-                true
-            } else {
-                false
-            }
+            matches!(
+                e,
+                &Err((
+                    KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull),
+                    _
+                ))
+            )
         })
         .count();
 
@@ -163,14 +233,15 @@ fn test_base_producer_queue_full() {
 #[test]
 fn test_base_producer_timeout() {
     let context = CollectingContext::new();
+    let bootstrap_server = get_bootstrap_server();
     let producer = base_producer_with_context(
         context.clone(),
         hashmap! {
-            "message.timeout.ms" => "1000",
-            "bootstrap.servers" => "1.2.3.4"
+            "message.timeout.ms" => "100",
+            "bootstrap.servers" => &bootstrap_server,
         },
     );
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_base_producer_timeout");
 
     let results_count = (0..10)
         .map(|id| {
@@ -182,10 +253,10 @@ fn test_base_producer_timeout() {
         })
         .filter(|r| r.is_ok())
         .count();
-
-    producer.flush(Duration::from_secs(10)).unwrap();
-
     assert_eq!(results_count, 10);
+
+    thread::sleep(Duration::from_secs(5)); // Make sure messages expire
+    producer.flush(Duration::from_secs(10)).unwrap();
 
     let delivery_results = context.results.lock().unwrap();
     let mut ids = HashSet::new();
@@ -281,7 +352,7 @@ fn test_base_producer_headers() {
         ids: ids_set.clone(),
     };
     let producer = base_producer_with_context(context, HashMap::new());
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_base_producer_headers");
 
     let results_count = (0..10)
         .map(|id| {
@@ -322,7 +393,7 @@ fn test_base_producer_headers() {
 fn test_threaded_producer_send() {
     let context = CollectingContext::new();
     let producer = threaded_producer_with_context(context.clone(), HashMap::new());
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_threaded_producer_send");
 
     let results_count = (0..10)
         .map(|id| {
@@ -351,9 +422,7 @@ fn test_threaded_producer_send() {
 #[test]
 fn test_base_producer_opaque_arc() -> Result<(), Box<dyn Error>> {
     struct OpaqueArcContext {}
-
     impl ClientContext for OpaqueArcContext {}
-
     impl ProducerContext for OpaqueArcContext {
         type DeliveryOpaque = Arc<Mutex<usize>>;
 
@@ -366,7 +435,7 @@ fn test_base_producer_opaque_arc() -> Result<(), Box<dyn Error>> {
     let shared_count = Arc::new(Mutex::new(0));
     let context = OpaqueArcContext {};
     let producer = base_producer_with_context(context, HashMap::new());
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_base_producer_opaque_arc");
 
     let results_count = (0..10)
         .map(|_| {
@@ -405,4 +474,89 @@ fn test_fatal_errors() {
             "test_fatal_error: fake error".into()
         ))
     )
+}
+
+#[test]
+fn test_register_custom_partitioner_linger_non_zero_key_null() {
+    // Custom partitioner is not used when sticky.partitioning.linger.ms > 0 and key is null.
+    // https://github.com/confluentinc/librdkafka/blob/081fd972fa97f88a1e6d9a69fc893865ffbb561a/src/rdkafka_msg.c#L1192-L1196
+    let context = CollectingContext::new_with_custom_partitioner(PanicPartitioner {});
+    let mut config_overrides = HashMap::new();
+    config_overrides.insert("sticky.partitioning.linger.ms", "10");
+    let producer = base_producer_with_context(context.clone(), config_overrides);
+
+    producer
+        .send(
+            BaseRecord::<(), str, usize>::with_opaque_to(
+                &rand_test_topic("test_register_custom_partitioner_linger_non_zero_key_null"),
+                0,
+            )
+            .payload(""),
+        )
+        .unwrap();
+    producer.flush(Duration::from_secs(10)).unwrap();
+
+    let delivery_results = context.results.lock().unwrap();
+
+    assert_eq!(delivery_results.len(), 1);
+
+    for (_, error, _) in &(*delivery_results) {
+        assert_eq!(*error, None);
+    }
+}
+
+#[test]
+fn test_custom_partitioner_base_producer() {
+    let context = CollectingContext::new_with_custom_partitioner(FixedPartitioner::new(2));
+    let producer = base_producer_with_context(context.clone(), HashMap::new());
+    let topic_name = rand_test_topic("test_custom_partitioner_base_producer");
+
+    let results_count = (0..10)
+        .map(|id| {
+            producer.send(
+                BaseRecord::with_opaque_to(&topic_name, id)
+                    .payload("")
+                    .key(""),
+            )
+        })
+        .filter(|r| r.is_ok())
+        .count();
+
+    assert_eq!(results_count, 10);
+    producer.flush(Duration::from_secs(10)).unwrap();
+
+    let delivery_results = context.results.lock().unwrap();
+
+    for (message, error, _) in &(*delivery_results) {
+        assert_eq!(error, &None);
+        assert_eq!(message.partition(), 2);
+    }
+}
+
+#[test]
+fn test_custom_partitioner_threaded_producer() {
+    let context = CollectingContext::new_with_custom_partitioner(FixedPartitioner::new(2));
+    let producer = threaded_producer_with_context(context.clone(), HashMap::new());
+    let topic_name = rand_test_topic("test_custom_partitioner_threaded_producer");
+
+    let results_count = (0..10)
+        .map(|id| {
+            producer.send(
+                BaseRecord::with_opaque_to(&topic_name, id)
+                    .payload("")
+                    .key(""),
+            )
+        })
+        .filter(|r| r.is_ok())
+        .count();
+
+    assert_eq!(results_count, 10);
+    producer.flush(Duration::from_secs(10)).unwrap();
+
+    let delivery_results = context.results.lock().unwrap();
+
+    for (message, error, _) in &(*delivery_results) {
+        assert_eq!(error, &None);
+        assert_eq!(message.partition(), 2);
+    }
 }

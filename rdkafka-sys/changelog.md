@@ -1,5 +1,35 @@
 # Changelog
 
+## v4.9.0+2.10.0
+* Add cargo enforcement of MSRV of 1.74.
+* Bump librdkafka to v2.10.0.
+
+## v4.7.0+2.2.0 (2023-11-07)
+
+* Upgrade to librdkafka v2.3.0.
+* Add cargo enforcement of MSRV of 1.61.
+
+## v4.6.0+2.2.0 (2023-08-25)
+
+* Upgrade to librdkafka v2.2.0.
+
+## v4.5.0+1.9.2 (2023-06-09)
+
+* Add support for the cluster mock API.
+
+## v4.4.0+1.9.2 (2023-05-12)
+
+* Add the `RDKafkaDeleteGroup` and `RDKafkaGroupResult` type aliases to the
+  `types` module.
+
+## v4.3.0+1.9.2 (2022-10-29)
+
+* Upgrade to librdkafka v1.9.2.
+
+* Support building outside of Cargo, where the `CARGO_MAKEFLAGS` environment
+  variable is unlikely to be set. The build script would previously panic if
+  `CARGO_MAKEFLAGS` was not set.
+
 ## v4.2.0+1.8.2 (2021-11-27)
 
 * Upgrade to librdkafka v1.8.2.

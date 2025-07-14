@@ -3,8 +3,8 @@
 //!
 //! ## The library
 //!
-//! `rust-rdkafka` provides a safe Rust interface to librdkafka. The master
-//! branch is currently based on librdkafka 1.8.2.
+//! `rust-rdkafka` provides a safe Rust interface to librdkafka. This version
+//! is compatible with librdkafka v1.9.2+.
 //!
 //! ### Documentation
 //!
@@ -131,6 +131,8 @@
 //!   the [blog post][timely-blog] announcing its Kafka integration.
 //! - [kafka-view]: a web interface for Kafka clusters.
 //! - [kafka-benchmark]: a high performance benchmarking tool for Kafka.
+//! - [callysto]: Stream processing framework in Rust.
+//! - [bytewax]: Python stream processing framework using Timely Dataflow.
 //!
 //! *If you are using rust-rdkafka, please let us know!*
 //!
@@ -174,7 +176,7 @@
 //!
 //! ### Minimum supported Rust version (MSRV)
 //!
-//! The current minimum supported Rust version (MSRV) is 1.45.0. Note that
+//! The current minimum supported Rust version (MSRV) is 1.70.0. Note that
 //! bumping the MSRV is not considered a breaking change. Any release of
 //! rust-rdkafka may bump the MSRV.
 //!
@@ -246,9 +248,10 @@
 //! [runtime-smol]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/runtime_smol.rs
 //! [runtime-async-std]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/runtime_async_std.rs
 //! [broker-compat]: https://github.com/edenhill/librdkafka/blob/master/INTRODUCTION.md#broker-version-compatibility
+//! [bytewax]: https://github.com/bytewax/bytewax
+//! [callysto]: https://github.com/vertexclique/callysto
 //! [`examples`]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/
 //! [futures]: https://github.com/rust-lang/futures-rs
-//! [kafka-benchmark]: https://github.com/fede1024/kafka-benchmark
 //! [kafka-benchmark]: https://github.com/fede1024/kafka-benchmark
 //! [kafka-view]: https://github.com/fede1024/kafka-view
 //! [librdkafka]: https://github.com/edenhill/librdkafka
@@ -269,7 +272,7 @@
 
 mod log;
 
-pub use rdkafka_sys::types;
+pub use rdkafka_sys::{bindings, helpers, types};
 
 pub mod admin;
 pub mod client;
@@ -279,6 +282,7 @@ pub mod error;
 pub mod groups;
 pub mod message;
 pub mod metadata;
+pub mod mocking;
 pub mod producer;
 pub mod statistics;
 pub mod topic_partition_list;

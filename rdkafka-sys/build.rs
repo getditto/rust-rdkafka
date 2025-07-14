@@ -1,6 +1,8 @@
 use std::borrow::Borrow;
 use std::env;
 use std::ffi::OsStr;
+#[cfg(feature = "cmake-build")]
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
@@ -71,7 +73,24 @@ fn main() {
                 process::exit(1);
             }
         }
+    } else if env::var("CARGO_FEATURE_STATIC_EXTERNAL").is_ok() {
+        if let Ok(rdkafka_dir) = env::var("DEP_LIBRDKAFKA_STATIC_ROOT") {
+            println!("cargo:rustc-link-search=native={}/src", rdkafka_dir);
+            println!("cargo:rustc-link-lib=static=rdkafka");
+            println!("cargo:root={}", rdkafka_dir);
+        } else {
+            eprintln!(
+                "Path to DEP_LIBRDKAFKA_STATIC_ROOT not set. Static linking failed. Exiting."
+            );
+            process::exit(1);
+        }
+        eprintln!("librdkafka will be linked statically using prebuilt binaries");
     } else {
+        // Ensure that we are in the right directory
+        let rdkafkasys_root = Path::new("rdkafka-sys");
+        if rdkafkasys_root.exists() {
+            assert!(env::set_current_dir(rdkafkasys_root).is_ok());
+        }
         if !Path::new("librdkafka/LICENSE").exists() {
             eprintln!("Setting up submodules");
             run_command_or_fail("../", "git", &["submodule", "update", "--init"]);
@@ -125,6 +144,16 @@ fn build_librdkafka() {
         configure_flags.push("--disable-zlib".into());
     }
 
+    if env::var("CARGO_FEATURE_CURL").is_ok() {
+        // There is no --enable-curl option, but it is enabled by default.
+        if let Ok(curl_root) = env::var("DEP_CURL_ROOT") {
+            cflags.push("-DCURLSTATIC_LIB".to_string());
+            cflags.push(format!("-I{}/include", curl_root));
+        }
+    } else {
+        configure_flags.push("--disable-curl".into());
+    }
+
     if env::var("CARGO_FEATURE_ZSTD").is_ok() {
         configure_flags.push("--enable-zstd".into());
         if let Ok(zstd_root) = env::var("DEP_ZSTD_ROOT") {
@@ -165,10 +194,9 @@ fn build_librdkafka() {
     run_command_or_fail(&out_dir, "./configure", configure_flags.as_slice());
 
     println!("Compiling librdkafka");
-    env::set_var(
-        "MAKEFLAGS",
-        env::var_os("CARGO_MAKEFLAGS").expect("CARGO_MAKEFLAGS env var missing"),
-    );
+    if let Some(makeflags) = env::var_os("CARGO_MAKEFLAGS") {
+        env::set_var("MAKEFLAGS", makeflags);
+    }
     run_command_or_fail(
         &out_dir,
         if cfg!(target_os = "freebsd") {
@@ -187,6 +215,7 @@ fn build_librdkafka() {
 #[cfg(feature = "cmake-build")]
 fn build_librdkafka() {
     let mut config = cmake::Config::new("librdkafka");
+    let mut cmake_library_paths = vec![];
 
     config
         .define("RDKAFKA_BUILD_STATIC", "1")
@@ -196,16 +225,43 @@ fn build_librdkafka() {
         // want a stable location that we can add to the linker search path.
         // Since we're not actually installing to /usr or /usr/local, there's no
         // harm to always using "lib" here.
-        .define("CMAKE_INSTALL_LIBDIR", "lib");
+        .define("CMAKE_INSTALL_LIBDIR", "lib")
+        // CMake 4.0.0 drops support for 3.2 compatibility, which is
+        // required by librdkafka 2.3.0.
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5");
 
     if env::var("CARGO_FEATURE_LIBZ").is_ok() {
         config.define("WITH_ZLIB", "1");
         config.register_dep("z");
         if let Ok(z_root) = env::var("DEP_Z_ROOT") {
-            env::set_var("CMAKE_LIBRARY_PATH", format!("{}/build", z_root));
+            cmake_library_paths.push(format!("{}/build", z_root));
         }
     } else {
         config.define("WITH_ZLIB", "0");
+    }
+
+    if env::var("CARGO_FEATURE_CURL").is_ok() {
+        config.define("WITH_CURL", "1");
+        config.register_dep("curl");
+        if let Ok(curl_root) = env::var("DEP_CURL_ROOT") {
+            config.define("CURL_STATICLIB", "1");
+            cmake_library_paths.push(format!("{}/lib", curl_root));
+
+            config.cflag("-DCURL_STATICLIB");
+            config.cxxflag("-DCURL_STATICLIB");
+            config.cflag(format!("-I{}/include", curl_root));
+            config.cxxflag(format!("-I{}/include", curl_root));
+            config.cflag(format!("-L{}/lib", curl_root));
+            config.cxxflag(format!("-L{}/lib", curl_root));
+            //FIXME: Upstream should be copying this in their build.rs
+            fs::copy(
+                format!("{}/build/libcurl.a", curl_root),
+                format!("{}/lib/libcurl.a", curl_root),
+            )
+            .unwrap();
+        }
+    } else {
+        config.define("WITH_CURL", "0");
     }
 
     if env::var("CARGO_FEATURE_SSL").is_ok() {
@@ -244,6 +300,14 @@ fn build_librdkafka() {
 
     if let Ok(system_name) = env::var("CMAKE_SYSTEM_NAME") {
         config.define("CMAKE_SYSTEM_NAME", system_name);
+    }
+
+    if let Ok(make_program) = env::var("CMAKE_MAKE_PROGRAM") {
+        config.define("CMAKE_MAKE_PROGRAM", make_program);
+    }
+
+    if !cmake_library_paths.is_empty() {
+        env::set_var("CMAKE_LIBRARY_PATH", cmake_library_paths.join(";"));
     }
 
     println!("Configuring and compiling librdkafka");

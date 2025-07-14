@@ -45,6 +45,11 @@ system, and it will configure the compiler to dynamically link against it.
 The system version of librdkafka must exactly match the version of
 librdkafka bundled with this crate.
 
+The **`static-linking`** feature can be used to link rdkafka to a locally
+built version of librdkafka: if the feature is enabled, the build script
+will try to find `DEP_LIBRDKAFKA_STATIC_ROOT` environment variable
+and it will statically link against it.
+
 The **`cmake-build`** feature builds librdkafka with its [CMake] build
 system, rather than its default [mklove]-based build system. This feature
 requires that CMake is installed on the build machine.
@@ -64,6 +69,10 @@ flags you would pass to `configure` if you were compiling manually).
     feature is enabled by default. By default, the system's libz is
     dynamically linked, but static linking of the version bundled with the
     [libz-sys] crate can be requested with the `libz-static` feature.
+  * The **`curl`** feature enables the HTTP client via curl. By default, the
+    system's curl is dynamically linked, but static linking of the version
+    bundled with the [curl-sys] create can be requested with the
+    `curl-static` feature.
   * The **`zstd`** feature enables support for ZSTD compression. By default,
     this builds and statically links the version bundled with the [zstd-sys]
     crate, but dynamic linking of the system's version can be requested with
@@ -81,6 +90,7 @@ process is defined in [`build.rs`].
 [Apache Kafka]: https://kafka.apache.org
 [CMake]: https://cmake.org
 [libz-sys]: https://crates.io/crates/libz-sys
+[curl-sys]: https://crates.io/crates/curl-sys
 [lz4-sys]: https://crates.io/crates/lz4-sys
 [mklove]: https://github.com/edenhill/mklove
 [openssl-sys]: https://crates.io/crates/openssl-sys

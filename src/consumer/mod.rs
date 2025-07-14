@@ -7,14 +7,14 @@ use std::time::Duration;
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
-use crate::client::{Client, ClientContext, NativeClient};
-use crate::error::KafkaResult;
+use crate::client::{Client, ClientContext};
+use crate::error::{KafkaError, KafkaResult};
 use crate::groups::GroupList;
 use crate::log::{error, trace};
 use crate::message::BorrowedMessage;
 use crate::metadata::Metadata;
 use crate::topic_partition_list::{Offset, TopicPartitionList};
-use crate::util::{cstr_to_owned, KafkaDrop, NativePtr, Timeout};
+use crate::util::{KafkaDrop, NativePtr, Timeout};
 
 pub mod base_consumer;
 pub mod stream_consumer;
@@ -33,7 +33,7 @@ pub enum Rebalance<'a> {
     /// A new partition revocation is received.
     Revoke(&'a TopicPartitionList),
     /// Unexpected error from Kafka.
-    Error(String),
+    Error(KafkaError),
 }
 
 /// Consumer-specific context.
@@ -43,7 +43,7 @@ pub enum Rebalance<'a> {
 /// be specified.
 ///
 /// See also the [`ClientContext`] trait.
-pub trait ConsumerContext: ClientContext {
+pub trait ConsumerContext: ClientContext + Sized {
     /// Implements the default rebalancing strategy and calls the
     /// [`pre_rebalance`](ConsumerContext::pre_rebalance) and
     /// [`post_rebalance`](ConsumerContext::post_rebalance) methods. If this
@@ -51,7 +51,7 @@ pub trait ConsumerContext: ClientContext {
     /// if needed.
     fn rebalance(
         &self,
-        native_client: &NativeClient,
+        base_consumer: &BaseConsumer<Self>,
         err: RDKafkaRespErr,
         tpl: &mut TopicPartitionList,
     ) {
@@ -59,16 +59,17 @@ pub trait ConsumerContext: ClientContext {
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__ASSIGN_PARTITIONS => Rebalance::Assign(tpl),
             RDKafkaRespErr::RD_KAFKA_RESP_ERR__REVOKE_PARTITIONS => Rebalance::Revoke(tpl),
             _ => {
-                let error = unsafe { cstr_to_owned(rdsys::rd_kafka_err2str(err)) };
-                error!("Error rebalancing: {}", error);
-                Rebalance::Error(error)
+                let error_code: RDKafkaErrorCode = err.into();
+                error!("Error rebalancing: {}", error_code);
+                Rebalance::Error(KafkaError::Rebalance(error_code))
             }
         };
 
         trace!("Running pre-rebalance with {:?}", rebalance);
-        self.pre_rebalance(&rebalance);
+        self.pre_rebalance(base_consumer, &rebalance);
 
         trace!("Running rebalance with {:?}", rebalance);
+        let native_client = base_consumer.native_client();
         // Execute rebalance
         unsafe {
             match err {
@@ -93,18 +94,18 @@ pub trait ConsumerContext: ClientContext {
             }
         }
         trace!("Running post-rebalance with {:?}", rebalance);
-        self.post_rebalance(&rebalance);
+        self.post_rebalance(base_consumer, &rebalance);
     }
 
     /// Pre-rebalance callback. This method will run before the rebalance and
     /// should terminate its execution quickly.
     #[allow(unused_variables)]
-    fn pre_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {}
+    fn pre_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {}
 
     /// Post-rebalance callback. This method will run after the rebalance and
     /// should terminate its execution quickly.
     #[allow(unused_variables)]
-    fn post_rebalance<'a>(&self, rebalance: &Rebalance<'a>) {}
+    fn post_rebalance(&self, base_consumer: &BaseConsumer<Self>, rebalance: &Rebalance<'_>) {}
 
     // TODO: convert pointer to structure
     /// Post commit callback. This method will run after a group of offsets was
@@ -113,12 +114,12 @@ pub trait ConsumerContext: ClientContext {
     fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {}
 
     /// Returns the minimum interval at which to poll the main queue, which
-    /// services the logging, stats, and error callbacks.
+    /// services the logging, stats, and error events.
     ///
     /// The main queue is polled once whenever [`BaseConsumer::poll`] is called.
     /// If `poll` is called with a timeout that is larger than this interval,
     /// then the main queue will be polled at that interval while the consumer
-    /// queue is blocked.
+    /// queue is blocked. This allows serving events while there are no messages.
     ///
     /// For example, if the main queue's minimum poll interval is 200ms and
     /// `poll` is called with a timeout of 1s, then `poll` may block for up to
@@ -237,6 +238,15 @@ where
     /// automatic consumer rebalance won't be activated.
     fn assign(&self, assignment: &TopicPartitionList) -> KafkaResult<()>;
 
+    /// Clears all topic and partitions currently assigned to the consumer
+    fn unassign(&self) -> KafkaResult<()>;
+
+    /// Incrementally add partitions from the current assignment
+    fn incremental_assign(&self, assignment: &TopicPartitionList) -> KafkaResult<()>;
+
+    /// Incrementally remove partitions from the current assignment
+    fn incremental_unassign(&self, assignment: &TopicPartitionList) -> KafkaResult<()>;
+
     /// Seeks to `offset` for the specified `topic` and `partition`. After a
     /// successful call to `seek`, the next poll of the consumer will return the
     /// message with `offset`.
@@ -248,10 +258,28 @@ where
         timeout: T,
     ) -> KafkaResult<()>;
 
+    /// Seeks consumer for partitions in `topic_partition_list` to the per-partition offset
+    /// in the `offset` field of `TopicPartitionListElem`.
+    /// The offset can be either absolute (>= 0) or a logical offset.
+    /// Seek should only be performed on already assigned/consumed partitions.
+    /// Individual partition errors are reported in the per-partition `error` field of
+    /// `TopicPartitionListElem`.
+    fn seek_partitions<T: Into<Timeout>>(
+        &self,
+        topic_partition_list: TopicPartitionList,
+        timeout: T,
+    ) -> KafkaResult<TopicPartitionList>;
+
     /// Commits the offset of the specified message. The commit can be sync
     /// (blocking), or async. Notice that when a specific offset is committed,
     /// all the previous offsets are considered committed as well. Use this
     /// method only if you are processing messages in order.
+    ///
+    /// The highest committed offset is interpreted as the next message to be
+    /// consumed in the event that a consumer rehydrates its local state from
+    /// the Kafka broker (i.e. consumer server restart). This means that,
+    /// in general, the offset of your [`TopicPartitionList`] should equal
+    /// 1 plus the offset from your last consumed message.
     fn commit(
         &self,
         topic_partition_list: &TopicPartitionList,
@@ -266,6 +294,10 @@ where
 
     /// Commit the provided message. Note that this will also automatically
     /// commit every message with lower offset within the same partition.
+    ///
+    /// This method is exactly equivalent to invoking [`Consumer::commit`]
+    /// with a [`TopicPartitionList`] which copies the topic and partition
+    /// from the message and adds 1 to the offset of the message.
     fn commit_message(&self, message: &BorrowedMessage<'_>, mode: CommitMode) -> KafkaResult<()>;
 
     /// Stores offset to be used on the next (auto)commit. When
@@ -286,6 +318,21 @@ where
 
     /// Returns the current partition assignment.
     fn assignment(&self) -> KafkaResult<TopicPartitionList>;
+
+    /// Check whether the consumer considers the current assignment to have been lost
+    /// involuntarily.
+    ///
+    /// This method is only applicable for use with a high level subscribing consumer. Assignments
+    /// are revoked immediately when determined to have been lost, so this method is only useful
+    /// when reacting to a rebalance or from within a rebalance_cb. Partitions
+    /// that have been lost may already be owned by other members in the group and therefore
+    /// commiting offsets, for example, may fail.
+    ///
+    /// Calling rd_kafka_assign(), rd_kafka_incremental_assign() or rd_kafka_incremental_unassign()
+    /// resets this flag.
+    ///
+    /// Returns true if the current partition assignment is considered lost, false otherwise.
+    fn assignment_lost(&self) -> bool;
 
     /// Retrieves the committed offsets for topics and partitions.
     fn committed<T>(&self, timeout: T) -> KafkaResult<TopicPartitionList>

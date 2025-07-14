@@ -11,8 +11,8 @@ library for Rust based on [librdkafka].
 
 ## The library
 
-`rust-rdkafka` provides a safe Rust interface to librdkafka. The master
-branch is currently based on librdkafka 1.8.2.
+`rust-rdkafka` provides a safe Rust interface to librdkafka. This version
+is compatible with librdkafka v1.9.2+.
 
 ### Documentation
 
@@ -135,11 +135,10 @@ To learn more about using transactions in rust-rdkafka, see the
 
 Here are some of the projects using rust-rdkafka:
 
-- [timely-dataflow]: a distributed data-parallel compute engine. See also
-  the [blog post][timely-blog] announcing its Kafka integration.
 - [kafka-view]: a web interface for Kafka clusters.
 - [kafka-benchmark]: a high performance benchmarking tool for Kafka.
 - [callysto]: Stream processing framework in Rust.
+- [bytewax]: Python stream processing framework using Timely Dataflow.
 
 *If you are using rust-rdkafka, please let us know!*
 
@@ -177,13 +176,17 @@ the system's version of librdkafka. Example:
 rdkafka = { version = "0.25", features = ["dynamic-linking"] }
 ```
 
+If you'd like to compile librdkafka statically yourself, then use
+that, you can use `static-linking` while supplying `DEP_LIBRDKAFKA_STATIC_ROOT`
+with path to where librdkafka was built.
+
 For a full listing of features, consult the [rdkafka-sys crate's
 documentation][rdkafka-sys-features]. All of rdkafka-sys features are
 re-exported as rdkafka features.
 
 ### Minimum supported Rust version (MSRV)
 
-The current minimum supported Rust version (MSRV) is 1.45.0. Note that
+The current minimum supported Rust version (MSRV) is 1.70.0. Note that
 bumping the MSRV is not considered a breaking change. Any release of
 rust-rdkafka may bump the MSRV.
 
@@ -216,9 +219,13 @@ cargo run --example <example_name> -- <example_args>
 
 ## Debugging
 
-rust-rdkafka uses the [`log`] and [`env_logger`] crates to handle logging.
-Logging can be enabled using the `RUST_LOG` environment variable, for
-example:
+rust-rdkafka uses the [`log`] crate to handle logging.
+Optionally, enable the `tracing` feature to emit [`tracing`]
+events as opposed to [`log`] records.
+
+In test and examples, rust-rdkafka uses the  [`env_logger`] crate
+to format logs. In those contexts, logging can be enabled
+using the `RUST_LOG` environment variable, for example:
 
 ```bash
 RUST_LOG="librdkafka=trace,rdkafka::client=debug" cargo test
@@ -243,6 +250,7 @@ logging framework.
 [`StreamConsumer`]: https://docs.rs/rdkafka/*/rdkafka/consumer/stream_consumer/struct.StreamConsumer.html
 [`ThreadedProducer`]: https://docs.rs/rdkafka/*/rdkafka/producer/base_producer/struct.ThreadedProducer.html
 [`log`]: https://docs.rs/log
+[`tracing`]: https://docs.rs/tracing
 [`env_logger`]: https://docs.rs/env_logger
 [Apache Kafka]: https://kafka.apache.org
 [asynchronous processing example]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/asynchronous_processing.rs
@@ -250,9 +258,10 @@ logging framework.
 [runtime-smol]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/runtime_smol.rs
 [runtime-async-std]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/runtime_async_std.rs
 [broker-compat]: https://github.com/edenhill/librdkafka/blob/master/INTRODUCTION.md#broker-version-compatibility
+[bytewax]: https://github.com/bytewax/bytewax
+[callysto]: https://github.com/vertexclique/callysto
 [`examples`]: https://github.com/fede1024/rust-rdkafka/blob/master/examples/
 [futures]: https://github.com/rust-lang/futures-rs
-[kafka-benchmark]: https://github.com/fede1024/kafka-benchmark
 [kafka-benchmark]: https://github.com/fede1024/kafka-benchmark
 [kafka-view]: https://github.com/fede1024/kafka-view
 [librdkafka]: https://github.com/edenhill/librdkafka
@@ -262,9 +271,6 @@ logging framework.
 [rdkafka-sys-features]: https://github.com/fede1024/rust-rdkafka/tree/master/rdkafka-sys/README.md#features
 [rdkafka-sys-known-issues]: https://github.com/fede1024/rust-rdkafka/tree/master/rdkafka-sys/README.md#known-issues
 [smol]: https://docs.rs/smol
-[timely-blog]: https://github.com/frankmcsherry/blog/blob/master/posts/2017-11-08.md
-[timely-dataflow]: https://github.com/frankmcsherry/timely-dataflow
-[callysto]: https://github.com/vertexclique/callysto
 [Tokio]: https://tokio.rs/
 
 ## rdkafka-sys

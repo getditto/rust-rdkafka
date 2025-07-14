@@ -4,9 +4,10 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 
-use futures::future::{self, FutureExt};
+use futures::future;
 use futures::stream::StreamExt;
 use maplit::hashmap;
+use rdkafka_sys::RDKafkaErrorCode;
 use tokio::time::{self, Duration};
 
 use rdkafka::consumer::{CommitMode, Consumer, ConsumerContext, StreamConsumer};
@@ -51,7 +52,10 @@ async fn test_invalid_max_poll_interval() {
     .create();
     match res {
         Err(KafkaError::ClientConfig(RDKafkaConfRes::RD_KAFKA_CONF_INVALID, desc, key, value)) => {
-            assert_eq!(desc, "Configuration property \"max.poll.interval.ms\" value -1 is outside allowed range 1..86400000\n");
+            assert_eq!(
+                desc,
+                "Configuration property \"max.poll.interval.ms\" value -1 is outside allowed range 1..86400000\n"
+            );
             assert_eq!(key, "max.poll.interval.ms");
             assert_eq!(value, "-1");
         }
@@ -69,7 +73,7 @@ async fn test_produce_consume_base() {
     let _r = env_logger::try_init();
 
     let start_time = current_time_millis();
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_base");
     let message_map = populate_topic(&topic_name, 100, &value_fn, &key_fn, None, None).await;
     let consumer = create_stream_consumer(&rand_test_group(), None);
     consumer.subscribe(&[topic_name.as_str()]).unwrap();
@@ -104,7 +108,7 @@ async fn test_produce_consume_base() {
 async fn test_produce_consume_base_concurrent() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_base_concurrent");
     populate_topic(&topic_name, 100, &value_fn, &key_fn, None, None).await;
 
     let consumer = Arc::new(create_stream_consumer(&rand_test_group(), None));
@@ -134,7 +138,7 @@ async fn test_produce_consume_base_concurrent() {
 async fn test_produce_consume_base_assign() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_base_assign");
     populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(0), None).await;
     populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(1), None).await;
     populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(2), None).await;
@@ -165,12 +169,77 @@ async fn test_produce_consume_base_assign() {
     assert_eq!(partition_count, vec![10, 8, 1]);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn test_produce_consume_base_unassign() {
+    let _r = env_logger::try_init();
+
+    let topic_name = rand_test_topic("test_produce_consume_base_unassign");
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(0), None).await;
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(1), None).await;
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(2), None).await;
+    let consumer = create_stream_consumer(&rand_test_group(), None);
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
+        .unwrap();
+    tpl.add_partition_offset(&topic_name, 1, Offset::Offset(2))
+        .unwrap();
+    tpl.add_partition_offset(&topic_name, 2, Offset::Offset(9))
+        .unwrap();
+    consumer.assign(&tpl).unwrap();
+    let mut assignments = consumer.assignment().unwrap();
+    assert_eq!(assignments.count(), 3);
+
+    consumer.unassign().unwrap();
+    assignments = consumer.assignment().unwrap();
+    assert_eq!(assignments.count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_produce_consume_base_incremental_assign_and_unassign() {
+    let _r = env_logger::try_init();
+
+    let topic_name = rand_test_topic("test_produce_consume_base_incremental_assign_and_unassign");
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(0), None).await;
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(1), None).await;
+    populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(2), None).await;
+    let consumer = create_stream_consumer(&rand_test_group(), None);
+
+    // Adding a simple partition
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
+        .unwrap();
+    consumer.incremental_assign(&tpl).unwrap();
+    let mut assignments = consumer.assignment().unwrap();
+    assert_eq!(assignments.count(), 1);
+
+    // Adding another partition
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic_name, 1, Offset::Beginning)
+        .unwrap();
+    consumer.incremental_assign(&tpl).unwrap();
+    assignments = consumer.assignment().unwrap();
+    assert_eq!(assignments.count(), 2);
+
+    // Removing one partition
+    consumer.incremental_unassign(&tpl).unwrap();
+    assignments = consumer.assignment().unwrap();
+    assert_eq!(assignments.count(), 1);
+
+    // unassigning an non assigned partition should fail
+    let err = consumer.incremental_unassign(&tpl);
+
+    assert_eq!(
+        err,
+        Err(KafkaError::Subscription("_INVALID_ARG".to_string()))
+    )
+}
+
 // All produced messages should be consumed.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_produce_consume_with_timestamp() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_with_timestamp");
     let message_map =
         populate_topic(&topic_name, 100, &value_fn, &key_fn, Some(0), Some(1111)).await;
     let consumer = create_stream_consumer(&rand_test_group(), None);
@@ -211,7 +280,7 @@ async fn test_produce_consume_with_timestamp() {
 async fn test_consumer_commit_message() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_consumer_commit_message");
     populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(0), None).await;
     populate_topic(&topic_name, 11, &value_fn, &key_fn, Some(1), None).await;
     populate_topic(&topic_name, 12, &value_fn, &key_fn, Some(2), None).await;
@@ -289,7 +358,7 @@ async fn test_consumer_commit_message() {
 async fn test_consumer_store_offset_commit() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_consumer_store_offset_commit");
     populate_topic(&topic_name, 10, &value_fn, &key_fn, Some(0), None).await;
     populate_topic(&topic_name, 11, &value_fn, &key_fn, Some(1), None).await;
     populate_topic(&topic_name, 12, &value_fn, &key_fn, Some(2), None).await;
@@ -374,7 +443,7 @@ async fn test_consumer_store_offset_commit() {
 async fn test_consumer_commit_metadata() -> Result<(), Box<dyn Error>> {
     let _ = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_consumer_commit_metadata");
     let group_name = rand_test_group();
     populate_topic(&topic_name, 10, &value_fn, &key_fn, None, None).await;
 
@@ -425,11 +494,11 @@ async fn test_consumer_commit_metadata() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn test_consume_partition_order() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_consume_partition_order");
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(0), None).await;
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(1), None).await;
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(2), None).await;
@@ -479,16 +548,48 @@ async fn test_consume_partition_order() {
         let partition1 = consumer.split_partition_queue(&topic_name, 1).unwrap();
 
         let mut i = 0;
-        while i < 12 {
-            if let Some(m) = consumer.recv().now_or_never() {
-                let partition = m.unwrap().partition();
+        while i < 5 {
+            if let Ok(m) = time::timeout(Duration::from_millis(1000), consumer.recv()).await {
+                // retry on transient errors until we get a message
+                let m = match m {
+                    Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::BrokerTransportFailure,
+                    ))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut)) => {
+                        continue;
+                    }
+                    Err(err) => {
+                        panic!("Unexpected error receiving message: {:?}", err);
+                    }
+                    Ok(m) => m,
+                };
+                let partition: i32 = m.partition();
                 assert!(partition == 0 || partition == 2);
                 i += 1;
+            } else {
+                panic!("Timeout receiving message");
             }
 
-            if let Some(m) = partition1.recv().now_or_never() {
-                assert_eq!(m.unwrap().partition(), 1);
+            if let Ok(m) = time::timeout(Duration::from_millis(1000), partition1.recv()).await {
+                // retry on transient errors until we get a message
+                let m = match m {
+                    Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::BrokerTransportFailure,
+                    ))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut)) => {
+                        continue;
+                    }
+                    Err(err) => {
+                        panic!("Unexpected error receiving message: {:?}", err);
+                    }
+                    Ok(m) => m,
+                };
+                assert_eq!(m.partition(), 1);
                 i += 1;
+            } else {
+                panic!("Timeout receiving message");
             }
         }
     }

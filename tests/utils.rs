@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::env::{self, VarError};
+use std::sync::Once;
 use std::time::Duration;
 
-use rand::Rng;
+use rand::distr::{Alphanumeric, SampleString};
 use regex::Regex;
 
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
@@ -17,27 +18,18 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::statistics::Statistics;
 use rdkafka::TopicPartitionList;
 
-pub fn rand_test_topic() -> String {
-    let id = rand::thread_rng()
-        .gen_ascii_chars()
-        .take(10)
-        .collect::<String>();
-    format!("__test_{}", id)
+pub fn rand_test_topic(test_name: &str) -> String {
+    let id = Alphanumeric.sample_string(&mut rand::rng(), 10);
+    format!("__{}_{}", test_name, id)
 }
 
 pub fn rand_test_group() -> String {
-    let id = rand::thread_rng()
-        .gen_ascii_chars()
-        .take(10)
-        .collect::<String>();
+    let id = Alphanumeric.sample_string(&mut rand::rng(), 10);
     format!("__test_{}", id)
 }
 
 pub fn rand_test_transactional_id() -> String {
-    let id = rand::thread_rng()
-        .gen_ascii_chars()
-        .take(10)
-        .collect::<String>();
+    let id = Alphanumeric.sample_string(&mut rand::rng(), 10);
     format!("__test_{}", id)
 }
 
@@ -67,9 +59,7 @@ pub fn get_broker_version() -> KafkaVersion {
             panic!("KAFKA_VERSION env var contained non-unicode characters")
         }
         // If the environment variable is unset, assume we're running the latest version.
-        Err(VarError::NotPresent) => {
-            KafkaVersion(std::u32::MAX, std::u32::MAX, std::u32::MAX, std::u32::MAX)
-        }
+        Err(VarError::NotPresent) => KafkaVersion(u32::MAX, u32::MAX, u32::MAX, u32::MAX),
     }
 }
 
@@ -118,7 +108,6 @@ where
     let producer = &ClientConfig::new()
         .set("bootstrap.servers", get_bootstrap_server().as_str())
         .set("statistics.interval.ms", "500")
-        .set("api.version.request", "true")
         .set("debug", "all")
         .set("message.timeout.ms", "30000")
         .create_with_context::<ProducerTestContext, FutureProducer<_>>(prod_context)
@@ -148,7 +137,7 @@ where
     let mut message_map = HashMap::new();
     for (id, future) in futures {
         match future.await {
-            Ok((partition, offset)) => message_map.insert((partition, offset), id),
+            Ok(delivered) => message_map.insert((delivered.partition, delivered.offset), id),
             Err((kafka_error, _message)) => panic!("Delivery failed: {}", kafka_error),
         };
     }
@@ -162,27 +151,6 @@ pub fn value_fn(id: i32) -> String {
 
 pub fn key_fn(id: i32) -> String {
     format!("Key {}", id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_populate_topic() {
-        let topic_name = rand_test_topic();
-        let message_map = populate_topic(&topic_name, 100, &value_fn, &key_fn, Some(0), None).await;
-
-        let total_messages = message_map
-            .iter()
-            .filter(|&(&(partition, _), _)| partition == 0)
-            .count();
-        assert_eq!(total_messages, 100);
-
-        let mut ids = message_map.iter().map(|(_, id)| *id).collect::<Vec<_>>();
-        ids.sort();
-        assert_eq!(ids, (0..100).collect::<Vec<_>>());
-    }
 }
 
 pub struct ConsumerTestContext {
@@ -215,8 +183,6 @@ pub fn consumer_config(
     config.set("enable.partition.eof", "false");
     config.set("session.timeout.ms", "6000");
     config.set("enable.auto.commit", "false");
-    config.set("statistics.interval.ms", "500");
-    config.set("api.version.request", "true");
     config.set("debug", "all");
     config.set("auto.offset.reset", "earliest");
 
@@ -227,4 +193,33 @@ pub fn consumer_config(
     }
 
     config
+}
+
+static INIT: Once = Once::new();
+
+pub fn configure_logging_for_tests() {
+    INIT.call_once(|| {
+        env_logger::try_init().expect("Failed to initialize env_logger");
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_populate_topic() {
+        let topic_name = rand_test_topic("test_populate_topic");
+        let message_map = populate_topic(&topic_name, 100, &value_fn, &key_fn, Some(0), None).await;
+
+        let total_messages = message_map
+            .iter()
+            .filter(|&(&(partition, _), _)| partition == 0)
+            .count();
+        assert_eq!(total_messages, 100);
+
+        let mut ids = message_map.values().copied().collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, (0..100).collect::<Vec<_>>());
+    }
 }

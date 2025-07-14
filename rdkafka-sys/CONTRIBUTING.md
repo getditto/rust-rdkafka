@@ -1,17 +1,27 @@
 # Maintainer and contributor instructions
 
-## Bindings
+## Upgrading librdkafka
 
-To regenerate the bindings:
+To update to a new version of librdkafka:
 
 ``` bash
 git submodule update --init
-cargo install bindgen
+cd rdkafka-sys/librdkafka
+git checkout $DESIRED_VERSION
+cargo install bindgen-cli
 ./update-bindings.sh
 ```
 
-## Updating
+Then:
 
-To upgrade change the git submodule in `librdkafka`, check if new errors need to
-be added to `helpers::primive_to_rd_kafka_resp_err_t` and update the version in
-`Cargo.toml`.
+  * Add a changelog entry to rdkafka-sys/changelog.md.
+  * Update src/lib.rs with the new version.
+
+## Releasing
+
+* Checkout into master and pull the latest changes.
+* Ensure the changelog is up to date (i.e not Unreleased changes).
+* Run `cd rdkafka-sys && ../generate_readme.py > README.md`.
+* Bump the version in Cargo.toml and commit locally.
+* Run `cargo publish`.
+* Push the commit.

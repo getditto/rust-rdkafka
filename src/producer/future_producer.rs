@@ -3,6 +3,7 @@
 //! See the [`FutureProducer`] for details.
 // TODO: extend docs
 
+use std::error::Error;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -13,15 +14,20 @@ use std::time::{Duration, Instant};
 use futures_channel::oneshot;
 use futures_util::FutureExt;
 
-use crate::client::{Client, ClientContext, DefaultClientContext, OAuthResult};
+use crate::client::{Client, ClientContext, DefaultClientContext, OAuthToken};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext, RDKafkaLogLevel};
 use crate::consumer::ConsumerGroupMetadata;
 use crate::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
 use crate::message::{Message, OwnedHeaders, OwnedMessage, Timestamp, ToBytes};
-use crate::producer::{BaseRecord, DeliveryResult, Producer, ProducerContext, ThreadedProducer};
+use crate::producer::{
+    BaseRecord, DeliveryResult, NoCustomPartitioner, Producer, ProducerContext, PurgeConfig,
+    ThreadedProducer,
+};
 use crate::statistics::Statistics;
 use crate::topic_partition_list::TopicPartitionList;
 use crate::util::{AsyncRuntime, DefaultRuntime, IntoOpaque, Timeout};
+
+use super::Partitioner;
 
 //
 // ********** FUTURE PRODUCER **********
@@ -126,17 +132,28 @@ pub struct FutureProducerContext<C: ClientContext + 'static> {
     wrapped_context: C,
 }
 
-/// Represents the result of message production as performed from the
-/// `FutureProducer`.
+/// Contains information about a successfully delivered message
+#[derive(Debug, PartialEq, Eq)]
+pub struct Delivery {
+    /// The partition the message was delivered to
+    pub partition: i32,
+    /// The offset within the partition
+    pub offset: i64,
+    /// The timestamp associated with the message
+    pub timestamp: Timestamp,
+}
+
+/// Represents the result of message production as performed from the FutureProducer.
 ///
-/// If message delivery was successful, `OwnedDeliveryResult` will return the
-/// partition and offset of the message. If the message failed to be delivered
-/// an error will be returned, together with an owned copy of the original
-/// message.
-pub type OwnedDeliveryResult = Result<(i32, i64), (KafkaError, OwnedMessage)>;
+/// If message delivery was successful, returns `DeliveredMessage` containing the partition,
+/// offset and timestamp. If the message failed to be delivered, returns the error and
+/// an owned copy of the original message.
+pub type OwnedDeliveryResult = Result<Delivery, (KafkaError, OwnedMessage)>;
 
 // Delegates all the methods calls to the wrapped context.
 impl<C: ClientContext + 'static> ClientContext for FutureProducerContext<C> {
+    const ENABLE_REFRESH_OAUTH_TOKEN: bool = C::ENABLE_REFRESH_OAUTH_TOKEN;
+
     fn log(&self, level: RDKafkaLogLevel, fac: &str, log_message: &str) {
         self.wrapped_context.log(level, fac, log_message);
     }
@@ -153,13 +170,20 @@ impl<C: ClientContext + 'static> ClientContext for FutureProducerContext<C> {
         self.wrapped_context.error(error, reason);
     }
 
-    fn generate_oauth_token(&self, oauthbearer_config: &str) -> OAuthResult {
+    fn generate_oauth_token(
+        &self,
+        oauthbearer_config: Option<&str>,
+    ) -> Result<OAuthToken, Box<dyn Error>> {
         self.wrapped_context
             .generate_oauth_token(oauthbearer_config)
     }
 }
 
-impl<C: ClientContext + 'static> ProducerContext for FutureProducerContext<C> {
+impl<C, Part> ProducerContext<Part> for FutureProducerContext<C>
+where
+    C: ClientContext + 'static,
+    Part: Partitioner,
+{
     type DeliveryOpaque = Box<oneshot::Sender<OwnedDeliveryResult>>;
 
     fn delivery(
@@ -168,7 +192,11 @@ impl<C: ClientContext + 'static> ProducerContext for FutureProducerContext<C> {
         tx: Box<oneshot::Sender<OwnedDeliveryResult>>,
     ) {
         let owned_delivery_result = match *delivery_result {
-            Ok(ref message) => Ok((message.partition(), message.offset())),
+            Ok(ref message) => Ok(Delivery {
+                partition: message.partition(),
+                offset: message.offset(),
+                timestamp: message.timestamp(),
+            }),
             Err((ref error, ref message)) => Err((error.clone(), message.detach())),
         };
         let _ = tx.send(owned_delivery_result); // TODO: handle error
@@ -187,11 +215,12 @@ impl<C: ClientContext + 'static> ProducerContext for FutureProducerContext<C> {
 /// underlying producer. The internal polling thread will be terminated when the
 /// `FutureProducer` goes out of scope.
 #[must_use = "Producer polling thread will stop immediately if unused"]
-pub struct FutureProducer<C = DefaultClientContext, R = DefaultRuntime>
+pub struct FutureProducer<C = DefaultClientContext, R = DefaultRuntime, Part = NoCustomPartitioner>
 where
+    Part: Partitioner,
     C: ClientContext + 'static,
 {
-    producer: Arc<ThreadedProducer<FutureProducerContext<C>>>,
+    producer: Arc<ThreadedProducer<FutureProducerContext<C>, Part>>,
     _runtime: PhantomData<R>,
 }
 
@@ -330,6 +359,7 @@ where
 
     /// Like [`FutureProducer::send`], but if enqueuing fails, an error will be
     /// returned immediately, alongside the [`FutureRecord`] provided.
+    #[allow(clippy::result_large_err)]
     pub fn send_result<'a, K, P>(
         &self,
         record: FutureRecord<'a, K, P>,
@@ -355,10 +385,11 @@ where
     }
 }
 
-impl<C, R> Producer<FutureProducerContext<C>> for FutureProducer<C, R>
+impl<C, R, Part> Producer<FutureProducerContext<C>, Part> for FutureProducer<C, R, Part>
 where
     C: ClientContext + 'static,
     R: AsyncRuntime,
+    Part: Partitioner,
 {
     fn client(&self) -> &Client<FutureProducerContext<C>> {
         self.producer.client()
@@ -366,6 +397,10 @@ where
 
     fn flush<T: Into<Timeout>>(&self, timeout: T) -> KafkaResult<()> {
         self.producer.flush(timeout)
+    }
+
+    fn purge(&self, flags: PurgeConfig) {
+        self.producer.purge(flags)
     }
 
     fn in_flight_count(&self) -> i32 {
@@ -409,7 +444,7 @@ mod tests {
     struct TestContext;
 
     impl ClientContext for TestContext {}
-    impl ProducerContext for TestContext {
+    impl ProducerContext<NoCustomPartitioner> for TestContext {
         type DeliveryOpaque = Box<i32>;
 
         fn delivery(&self, _: &DeliveryResult<'_>, _: Self::DeliveryOpaque) {
@@ -421,6 +456,7 @@ mod tests {
     #[test]
     fn test_future_producer_clone() {
         let producer = ClientConfig::new().create::<FutureProducer>().unwrap();
+        #[allow(clippy::redundant_clone)]
         let _producer_clone = producer.clone();
     }
 
@@ -431,6 +467,7 @@ mod tests {
         let producer = ClientConfig::new()
             .create_with_context::<_, FutureProducer<TestContext>>(test_context)
             .unwrap();
+        #[allow(clippy::redundant_clone)]
         let _producer_clone = producer.clone();
     }
 }

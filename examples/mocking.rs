@@ -1,64 +1,42 @@
+//! This example is similar to the roundtrip one but uses the mock API.
+
 use std::convert::TryInto;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use clap::{Arg, Command};
 use hdrhistogram::Histogram;
 
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
 use rdkafka::message::Message;
+use rdkafka::mocking::MockCluster;
 use rdkafka::producer::{FutureProducer, FutureRecord};
-
-use crate::example_utils::setup_logger;
-
-mod example_utils;
 
 #[tokio::main]
 async fn main() {
-    let matches = Command::new("Roundtrip example")
-        .version(option_env!("CARGO_PKG_VERSION").unwrap_or(""))
-        .about("Measures latency between producer and consumer")
-        .arg(
-            Arg::new("brokers")
-                .short('b')
-                .long("brokers")
-                .help("Broker list in kafka format")
-                .default_value("localhost:9092"),
-        )
-        .arg(Arg::new("topic").long("topic").help("topic").required(true))
-        .arg(
-            Arg::new("log-conf")
-                .long("log-conf")
-                .help("Configure the logging format (example: 'rdkafka=trace')"),
-        )
-        .get_matches();
-
-    setup_logger(true, matches.get_one("log-conf"));
-
-    let brokers = matches.get_one::<String>("brokers").unwrap();
-    let topic = matches.get_one::<String>("topic").unwrap().to_owned();
+    const TOPIC: &str = "test_topic";
+    let mock_cluster = MockCluster::new(3).unwrap();
+    mock_cluster
+        .create_topic(TOPIC, 32, 3)
+        .expect("Failed to create topic");
 
     let producer: FutureProducer = ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("message.timeout.ms", "5000")
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
         .create()
         .expect("Producer creation error");
 
     let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", brokers)
-        .set("session.timeout.ms", "6000")
-        .set("enable.auto.commit", "false")
-        .set("group.id", "rust-rdkafka-roundtrip-example")
+        .set("bootstrap.servers", mock_cluster.bootstrap_servers())
+        .set("group.id", "rust-rdkafka-mock-example")
         .create()
         .expect("Consumer creation failed");
-    consumer.subscribe(&[&topic]).unwrap();
+    consumer.subscribe(&[TOPIC]).unwrap();
 
     tokio::spawn(async move {
         let mut i = 0_usize;
         loop {
             producer
                 .send_result(
-                    FutureRecord::to(&topic)
+                    FutureRecord::to(TOPIC)
                         .key(&i.to_string())
                         .payload("dummy")
                         .timestamp(now()),

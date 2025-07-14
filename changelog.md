@@ -4,6 +4,107 @@ See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
 
 ## Unreleased
 
+None
+
+## 0.38.0 (2025-07-05)
+
+* Update `BaseProducer::poll` to not return early, and instead continue
+  looping until the passed timeout is reached.
+* **Breaking change.** Change signature for `OwnedDeliveryResult`. The
+  `Ok` variant is now a `Delivery` struct, rather than a tuple. This allows
+  or including `Timestamp` as a result field. It means that adding values
+  in the future will not require a breaking change.
+* Update `BaseProducer::flush` to correctly call `poll` internally, until
+  all messages have been processed.
+* Upgrade all library dependencies.
+* Add tests for Kafka versions up to 0.38.0.
+* Require a minimum of CMake 3.5 compatibility for CMake build ([#766])
+
+[#766]: https://github.com/fede1024/rust-rdkafka/pull/766
+
+## 0.37.0 (2024-11-25)
+
+* Update MSRV to 1.70
+* Fix test dependency on docker compose.
+* Address wakeup races introduced by pivoting to the event API.
+* Remove testing for old Kafka versions (before 3.0). Add tests for 3.7.
+
+## 0.36.2 (2024-01-16)
+
+* Update `BaseConsumer::poll` to return `None` when handling rebalance
+  or offset commit events.
+
+## 0.36.0 (2023-11-08)
+
+* Pivot the library from using librdkafka's callback interface to using
+  the event interface. The public API of the crate does not change.
+
+## 0.35.0 (2023-11-07)
+
+* Update bundled librdkafka to 2.3.0.
+* Add cargo enforcement of MSRV of 1.61.
+* Derives serde::Serialize on Statistics
+
+## 0.34.0 (2023-08-25)
+
+* Update bundled librdkafka to 2.2.0.
+
+## 0.33.2 (2023-07-06)
+
+* **Breaking change.** Change signature for `seek_partitions`. Following
+  librdkafka, individual partition errors should be reported in the per-partition
+  `error` field of `TopicPartitionList` elements.
+
+## 0.33.0 (2023-06-30)
+
+* Add interface to specify custom partitioners by extending `ProducerContext`
+  trait with capability to return optional custom partitioner.
+* Add `seek_partitions` to consumer.
+
+## 0.32.1 (2023-06-09)
+
+* Add support for the cluster mock API.
+* Expose assignment_lost method on the consumer.
+
+## 0.31.0 (2023-05-17)
+
+* **Breaking change.** Pass `KafkaError` to rebalance hooks instead of human-readable string
+  representation.
+
+## 0.30.0 (2023-05-12)
+
+* Support for unassigning static partitions by passing `null` to `rdsys::rd_kafka_assign` and expose the
+feature as `unassign` in `base_consumer`
+
+* Expose `rdsys::rd_kafka_incremental_assign` and `rdsys::rd_kafka_incremental_unassign` in `base_consumer` for 
+incremental changes to static assignments
+
+* **Breaking change.** `util::get_rdkafka_version` now returns `(i32, String)`.
+  Previously, it returned `(u16, String)` which would silently truncate the hex
+  representation of the version:
+  > Interpreted as hex MM.mm.rr.xx:
+  > 
+  > MM = Major
+  > mm = minor
+  > rr = revision
+  > xx = pre-release id (0xff is the final release)
+  > E.g.: 0x010902ff = 1.9.2
+
+* Add the `AdminClient::delete_groups` method, which deletes consumer groups
+  from a Kafka cluster ([#510]).
+
+  Thanks, [@andrewinci].
+
+[@andrewinci]: https://github.com/andrewinci
+[#510]: https://github.com/fede1024/rust-rdkafka/issues/510
+
+* Add support for the `purge` API, that allows retreiving messages that were
+  queued for production when shutting down. It is automatically called on `Drop`.
+  Fixes leaking associated data (futures...).
+
+
+## 0.29.0 (2022-10-29)
+
 * **Breaking change.** Pass through errors from librdkafka in
   `BaseProducer::flush`, `StreamProducer::flush`, and `FutureProducer::flush`.
 
@@ -58,12 +159,16 @@ See also the [rdkafka-sys changelog](rdkafka-sys/changelog.md).
 * Add a `tracing` feature which, when enabled, emits log messages using the
   `tracing` crate rather than the `log` crate.
 
-* Add support for the `OAUTHBEARER` authentication type via the new
+* Add support for the `OAUTHBEARER` SASL authentication mechanism via the new
+  `ClientContext::ENABLE_REFRESH_OAUTH_TOKEN` constant and the new
   `ClientContext::generate_oauth_token` method.
+
+  Thanks, [@jsurany-bloomberg].
 
 [#417]: https://github.com/fede1024/rust-rdkafka/issues/417
 [@bruceg]: https://github.com/bruceg
 [@cjubb39]: https://github.com/cjubb39
+[@jsurany-bloomberg]: https://github.com/jsurany-bloomberg
 
 ## 0.28.0 (2021-11-27)
 

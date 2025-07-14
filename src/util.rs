@@ -1,5 +1,6 @@
 //! Utility functions and types.
 
+use std::cmp;
 use std::ffi::CStr;
 use std::fmt;
 use std::future::Future;
@@ -12,7 +13,7 @@ use std::slice;
 use std::sync::Arc;
 #[cfg(feature = "naive-runtime")]
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "naive-runtime")]
 use futures_channel::oneshot;
@@ -25,10 +26,45 @@ use rdkafka_sys as rdsys;
 
 /// Returns a tuple representing the version of `librdkafka` in hexadecimal and
 /// string format.
-pub fn get_rdkafka_version() -> (u16, String) {
-    let version_number = unsafe { rdsys::rd_kafka_version() } as u16;
+pub fn get_rdkafka_version() -> (i32, String) {
+    let version_number = unsafe { rdsys::rd_kafka_version() };
     let c_str = unsafe { CStr::from_ptr(rdsys::rd_kafka_version_str()) };
     (version_number, c_str.to_string_lossy().into_owned())
+}
+
+pub(crate) enum Deadline {
+    At(Instant),
+    Never,
+}
+
+impl Deadline {
+    // librdkafka's flush api requires an i32 millisecond timeout
+    const MAX_FLUSH_DURATION: Duration = Duration::from_millis(i32::MAX as u64);
+
+    pub(crate) fn new(duration: Option<Duration>) -> Self {
+        if let Some(d) = duration {
+            Self::At(Instant::now() + d)
+        } else {
+            Self::Never
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        if let Deadline::At(i) = self {
+            *i - Instant::now()
+        } else {
+            Duration::MAX
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn remaining_millis_i32(&self) -> i32 {
+        cmp::min(Deadline::MAX_FLUSH_DURATION, self.remaining()).as_millis() as i32
+    }
+
+    pub(crate) fn elapsed(&self) -> bool {
+        self.remaining() <= Duration::ZERO
+    }
 }
 
 /// Specifies a timeout for a Kafka operation.
@@ -48,6 +84,22 @@ impl Timeout {
             Timeout::Never => -1,
         }
     }
+
+    /// Saturating `Duration` subtraction to Timeout.
+    pub(crate) fn saturating_sub(&self, rhs: Duration) -> Timeout {
+        match (self, rhs) {
+            (Timeout::After(lhs), rhs) => Timeout::After(lhs.saturating_sub(rhs)),
+            (Timeout::Never, _) => Timeout::Never,
+        }
+    }
+
+    /// Returns `true` if the timeout is zero.
+    pub(crate) fn is_zero(&self) -> bool {
+        match self {
+            Timeout::After(d) => d.is_zero(),
+            Timeout::Never => false,
+        }
+    }
 }
 
 impl std::ops::SubAssign for Timeout {
@@ -56,6 +108,26 @@ impl std::ops::SubAssign for Timeout {
             (Timeout::After(lhs), Timeout::After(rhs)) => *lhs -= rhs,
             (Timeout::Never, Timeout::After(_)) => (),
             _ => panic!("subtraction of Timeout::Never is ill-defined"),
+        }
+    }
+}
+
+impl From<Timeout> for Deadline {
+    fn from(t: Timeout) -> Deadline {
+        if let Timeout::After(dur) = t {
+            Deadline::new(Some(dur))
+        } else {
+            Deadline::new(None)
+        }
+    }
+}
+
+impl From<&Deadline> for Timeout {
+    fn from(d: &Deadline) -> Timeout {
+        if let Deadline::Never = d {
+            Timeout::Never
+        } else {
+            Timeout::After(d.remaining())
         }
     }
 }
@@ -235,24 +307,13 @@ impl fmt::Display for ErrBuf {
     }
 }
 
-pub(crate) trait WrappedCPointer {
-    type Target;
-
-    fn ptr(&self) -> *mut Self::Target;
-
-    fn is_null(&self) -> bool {
-        self.ptr().is_null()
-    }
+pub(crate) trait AsCArray<T> {
+    fn as_c_array(&self) -> *mut *mut T;
 }
 
-/// Converts a container into a C array.
-pub(crate) trait AsCArray<T: WrappedCPointer> {
-    fn as_c_array(&self) -> *mut *mut T::Target;
-}
-
-impl<T: WrappedCPointer> AsCArray<T> for Vec<T> {
-    fn as_c_array(&self) -> *mut *mut T::Target {
-        self.as_ptr() as *mut *mut T::Target
+impl<T: KafkaDrop> AsCArray<T> for Vec<NativePtr<T>> {
+    fn as_c_array(&self) -> *mut *mut T {
+        self.as_ptr() as *mut *mut T
     }
 }
 
@@ -274,20 +335,11 @@ where
     }
 }
 
+// This function is an internal implementation detail
+#[allow(clippy::missing_safety_doc)]
 pub(crate) unsafe trait KafkaDrop {
     const TYPE: &'static str;
     const DROP: unsafe extern "C" fn(*mut Self);
-}
-
-impl<T> WrappedCPointer for NativePtr<T>
-where
-    T: KafkaDrop,
-{
-    type Target = T;
-
-    fn ptr(&self) -> *mut T {
-        self.ptr.as_ptr()
-    }
 }
 
 impl<T> Deref for NativePtr<T>
@@ -319,19 +371,6 @@ where
 
     pub(crate) fn ptr(&self) -> *mut T {
         self.ptr.as_ptr()
-    }
-}
-
-pub(crate) struct OnDrop<F>(pub F)
-where
-    F: Fn();
-
-impl<F> Drop for OnDrop<F>
-where
-    F: Fn(),
-{
-    fn drop(&mut self) {
-        (self.0)()
     }
 }
 
@@ -392,6 +431,7 @@ pub type DefaultRuntime = ();
 #[cfg(all(not(feature = "tokio"), feature = "naive-runtime"))]
 pub type DefaultRuntime = NaiveRuntime;
 
+#[allow(rustdoc::broken_intra_doc_links)]
 /// The default [`AsyncRuntime`] used when one is not explicitly specified.
 ///
 /// This is defined to be the [`TokioRuntime`] when the `tokio` feature is
@@ -458,5 +498,17 @@ impl AsyncRuntime for TokioRuntime {
 
     fn delay_for(duration: Duration) -> Self::Delay {
         tokio::time::sleep(duration)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rdkafka_version() {
+        let rdk_version = unsafe { rdsys::rd_kafka_version() };
+        let (version_int, _) = get_rdkafka_version();
+        assert_eq!(rdk_version, version_int);
     }
 }

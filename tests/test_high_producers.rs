@@ -11,6 +11,7 @@ use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Headers, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord, Producer};
 use rdkafka::util::Timeout;
+use rdkafka::Timestamp;
 
 use crate::utils::*;
 
@@ -30,7 +31,7 @@ fn future_producer(config_overrides: HashMap<&str, &str>) -> FutureProducer<Defa
 #[tokio::test]
 async fn test_future_producer_send() {
     let producer = future_producer(HashMap::new());
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_future_producer_send");
 
     let results: FuturesUnordered<_> = (0..10)
         .map(|_| {
@@ -44,9 +45,10 @@ async fn test_future_producer_send() {
     let results: Vec<_> = results.collect().await;
     assert!(results.len() == 10);
     for (i, result) in results.into_iter().enumerate() {
-        let (partition, offset) = result.unwrap();
-        assert_eq!(partition, 1);
-        assert_eq!(offset, i as i64);
+        let delivered = result.unwrap();
+        assert_eq!(delivered.partition, 1);
+        assert_eq!(delivered.offset, i as i64);
+        assert!(delivered.timestamp < Timestamp::now());
     }
 }
 
@@ -60,17 +62,17 @@ async fn test_future_producer_send_full() {
     config.insert("message.timeout.ms", "5000");
     config.insert("queue.buffering.max.messages", "1");
     let producer = &future_producer(config);
-    let topic_name = &rand_test_topic();
+    let topic_name = &rand_test_topic("test_future_producer_send_full");
 
     // Fill up the queue.
     producer
-        .send_result(FutureRecord::to(&topic_name).payload("A").key("B"))
+        .send_result(FutureRecord::to(topic_name).payload("A").key("B"))
         .unwrap();
 
     let send_message = |timeout| async move {
         let start = Instant::now();
         let res = producer
-            .send(FutureRecord::to(&topic_name).payload("A").key("B"), timeout)
+            .send(FutureRecord::to(topic_name).payload("A").key("B"), timeout)
             .await;
         match res {
             Ok(_) => panic!("send unexpectedly succeeded"),
@@ -153,6 +155,44 @@ async fn test_future_producer_send_fail() {
         }
         e => {
             panic!("Unexpected return value: {:?}", e);
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_future_undelivered() {
+    let delivery_future = {
+        let mut config = ClientConfig::new();
+        // There's no server running there
+        config
+            .set("bootstrap.servers", "localhost:47021")
+            .set("message.timeout.ms", "1");
+        let producer: FutureProducer = config.create().expect("Failed to create producer");
+
+        producer
+            .send_result(
+                FutureRecord::to("topic")
+                    .payload("payload")
+                    .key("key")
+                    .partition(100),
+            )
+            .expect("Failed to queue message")
+
+        // drop producer. This should resolve the future as per purge API (couldn't be delivered)
+    };
+
+    match delivery_future.await {
+        Ok(Err((kafka_error, owned_message))) => {
+            assert_eq!(
+                kafka_error.to_string(),
+                "Message production error: PurgeQueue (Local: Purged in queue)"
+            );
+            assert_eq!(owned_message.topic(), "topic");
+            assert_eq!(owned_message.key(), Some(b"key" as _));
+            assert_eq!(owned_message.payload(), Some(b"payload" as _));
+        }
+        v => {
+            panic!("Unexpected return value: {:?}", v);
         }
     }
 }

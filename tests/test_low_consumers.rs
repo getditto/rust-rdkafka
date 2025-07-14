@@ -1,6 +1,7 @@
 //! Test data consumption using low level consumers.
 
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -30,7 +31,7 @@ fn create_base_consumer(
 async fn test_produce_consume_seek() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_seek");
     populate_topic(&topic_name, 5, &value_fn, &key_fn, Some(0), None).await;
     let consumer = create_base_consumer(&rand_test_group(), None);
     consumer.subscribe(&[topic_name.as_str()]).unwrap();
@@ -90,13 +91,74 @@ async fn test_produce_consume_seek() {
     }
 }
 
+// Seeking should allow replaying messages and skipping messages.
+#[tokio::test]
+async fn test_produce_consume_seek_partitions() {
+    let _r = env_logger::try_init();
+
+    let topic_name = rand_test_topic("test_produce_consume_seek_partitions");
+    populate_topic(&topic_name, 30, &value_fn, &key_fn, None, None).await;
+
+    let consumer = create_base_consumer(&rand_test_group(), None);
+    consumer.subscribe(&[topic_name.as_str()]).unwrap();
+
+    let mut partition_offset_map = HashMap::new();
+    for message in consumer.iter().take(30) {
+        match message {
+            Ok(m) => {
+                let offset = partition_offset_map.entry(m.partition()).or_insert(0);
+                assert_eq!(m.offset(), *offset);
+                *offset += 1;
+            }
+            Err(e) => panic!("Error receiving message: {:?}", e),
+        }
+    }
+
+    let mut tpl = TopicPartitionList::new();
+    tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
+        .unwrap();
+    tpl.add_partition_offset(&topic_name, 1, Offset::End)
+        .unwrap();
+    tpl.add_partition_offset(&topic_name, 2, Offset::Offset(2))
+        .unwrap();
+
+    let r_tpl = consumer.seek_partitions(tpl, None).unwrap();
+    assert_eq!(r_tpl.elements().len(), 3);
+    for tpe in r_tpl.elements().iter() {
+        assert!(tpe.error().is_ok());
+    }
+
+    let msg_cnt_p0 = partition_offset_map.get(&0).unwrap();
+    let msg_cnt_p2 = partition_offset_map.get(&2).unwrap();
+    let total_msgs_to_read = msg_cnt_p0 + (msg_cnt_p2 - 2);
+    let mut poffset_map = HashMap::new();
+    for message in consumer.iter().take(total_msgs_to_read.try_into().unwrap()) {
+        match message {
+            Ok(m) => {
+                let offset = poffset_map.entry(m.partition()).or_insert(0);
+                if m.partition() == 0 {
+                    assert_eq!(m.offset(), *offset);
+                } else if m.partition() == 2 {
+                    assert_eq!(m.offset(), *offset + 2);
+                } else if m.partition() == 1 {
+                    panic!("Unexpected message from partition 1")
+                }
+                *offset += 1;
+            }
+            Err(e) => panic!("Error receiving message: {:?}", e),
+        }
+    }
+    assert_eq!(msg_cnt_p0, poffset_map.get(&0).unwrap());
+    assert_eq!(msg_cnt_p2 - 2, *poffset_map.get(&2).unwrap());
+}
+
 // All produced messages should be consumed.
 #[tokio::test]
 async fn test_produce_consume_iter() {
     let _r = env_logger::try_init();
 
     let start_time = current_time_millis();
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_iter");
     let message_map = populate_topic(&topic_name, 100, &value_fn, &key_fn, None, None).await;
     let consumer = create_base_consumer(&rand_test_group(), None);
     consumer.subscribe(&[topic_name.as_str()]).unwrap();
@@ -134,7 +196,7 @@ async fn test_pause_resume_consumer_iter() {
 
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_pause_resume_consumer_iter");
     populate_topic(
         &topic_name,
         MESSAGE_COUNT,
@@ -175,7 +237,7 @@ async fn test_pause_resume_consumer_iter() {
 async fn test_consume_partition_order() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_consume_partition_order");
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(0), None).await;
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(1), None).await;
     populate_topic(&topic_name, 4, &value_fn, &key_fn, Some(2), None).await;
@@ -226,13 +288,41 @@ async fn test_consume_partition_order() {
         let mut i = 0;
         while i < 12 {
             if let Some(m) = consumer.poll(Timeout::After(Duration::from_secs(0))) {
-                let partition = m.unwrap().partition();
+                // retry on transient errors until we get a message
+                let m = match m {
+                    Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::BrokerTransportFailure,
+                    ))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut)) => {
+                        continue;
+                    }
+                    Err(err) => {
+                        panic!("Unexpected error receiving message: {:?}", err);
+                    }
+                    Ok(m) => m,
+                };
+                let partition = m.partition();
                 assert!(partition == 0 || partition == 2);
                 i += 1;
             }
 
             if let Some(m) = partition1.poll(Timeout::After(Duration::from_secs(0))) {
-                assert_eq!(m.unwrap().partition(), 1);
+                // retry on transient errors until we get a message
+                let m = match m {
+                    Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::BrokerTransportFailure,
+                    ))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::AllBrokersDown))
+                    | Err(KafkaError::MessageConsumption(RDKafkaErrorCode::OperationTimedOut)) => {
+                        continue;
+                    }
+                    Err(err) => {
+                        panic!("Unexpected error receiving message: {:?}", err);
+                    }
+                    Ok(m) => m,
+                };
+                assert_eq!(m.partition(), 1);
                 i += 1;
             }
         }
@@ -267,7 +357,7 @@ async fn test_consume_partition_order() {
 async fn test_produce_consume_message_queue_nonempty_callback() {
     let _r = env_logger::try_init();
 
-    let topic_name = rand_test_topic();
+    let topic_name = rand_test_topic("test_produce_consume_message_queue_nonempty_callback");
 
     create_topic(&topic_name, 1).await;
 
@@ -295,11 +385,11 @@ async fn test_produce_consume_message_queue_nonempty_callback() {
         let timeout = Duration::from_secs(15);
         loop {
             let w = wakeups.load(Ordering::SeqCst);
-            if w == target {
-                break;
-            } else if w > target {
-                panic!("wakeups {} exceeds target {}", w, target);
-            }
+            match w.cmp(&target) {
+                std::cmp::Ordering::Equal => break,
+                std::cmp::Ordering::Greater => panic!("wakeups {} exceeds target {}", w, target),
+                std::cmp::Ordering::Less => (),
+            };
             thread::sleep(Duration::from_millis(100));
             if start.elapsed() > timeout {
                 panic!("timeout exceeded while waiting for wakeup");
@@ -356,6 +446,104 @@ async fn test_produce_consume_message_queue_nonempty_callback() {
     thread::sleep(Duration::from_secs(1));
     assert_eq!(wakeups.load(Ordering::SeqCst), 2);
 }
+
+//TODO: adjust the test to work, today set_nonempty_callback param is never called.
+// The test is disabled for now, as it is not working.
+// #[tokio::test]
+// async fn test_produce_consume_consumer_nonempty_callback() {
+//     let _r = env_logger::try_init();
+
+//     let topic_name = rand_test_topic("test_produce_consume_consumer_nonempty_callback");
+
+//     create_topic(&topic_name, 1).await;
+
+//     // Turn off statistics to prevent interference with the wakeups counter.
+//     let mut config_overrides = HashMap::new();
+//     config_overrides.insert("statistics.interval.ms", "0");
+
+//     let mut consumer: BaseConsumer<_> = consumer_config(&rand_test_group(), Some(config_overrides))
+//         .create_with_context(ConsumerTestContext { _n: 64 })
+//         .expect("Consumer creation failed");
+
+//     let mut tpl = TopicPartitionList::new();
+//     tpl.add_partition_offset(&topic_name, 0, Offset::Beginning)
+//         .unwrap();
+//     consumer.assign(&tpl).unwrap();
+
+//     let wakeups = Arc::new(AtomicUsize::new(0));
+//     consumer.set_nonempty_callback({
+//         let wakeups = wakeups.clone();
+//         move || {
+//             print!("Setting nonempty callback");
+//             wakeups.fetch_add(1, Ordering::SeqCst);
+//         }
+//     });
+
+//     let wait_for_wakeups = |target| {
+//         let start = Instant::now();
+//         let timeout = Duration::from_secs(15);
+//         loop {
+//             let w = wakeups.load(Ordering::SeqCst);
+//             match w.cmp(&target) {
+//                 std::cmp::Ordering::Equal => break,
+//                 std::cmp::Ordering::Greater => panic!("wakeups {} exceeds target {}", w, target),
+//                 std::cmp::Ordering::Less => (),
+//             };
+//             thread::sleep(Duration::from_millis(100));
+//             if start.elapsed() > timeout {
+//                 panic!("timeout exceeded while waiting for wakeup");
+//             }
+//         }
+//     };
+
+//     // Initiate connection.
+//     assert!(consumer.poll(Duration::from_secs(0)).is_none());
+
+//     // Expect no wakeups for 1s.
+//     thread::sleep(Duration::from_secs(1));
+//     assert_eq!(wakeups.load(Ordering::SeqCst), 0);
+
+//     // Verify there are no messages waiting.
+//     assert!(consumer.poll(Duration::from_secs(0)).is_none());
+
+//     // Populate the topic, and expect a wakeup notifying us of the new messages.
+//     populate_topic(&topic_name, 2, &value_fn, &key_fn, None, None).await;
+//     wait_for_wakeups(1);
+
+//     // Read one of the messages.
+//     assert!(consumer.poll(Duration::from_secs(0)).is_some());
+
+//     // Add more messages to the topic. Expect no additional wakeups, as the
+//     // queue is not fully drained, for 1s.
+//     populate_topic(&topic_name, 2, &value_fn, &key_fn, None, None).await;
+//     thread::sleep(Duration::from_secs(1));
+//     assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+
+//     // Drain the queue.
+//     assert!(consumer.poll(None).is_some());
+//     assert!(consumer.poll(None).is_some());
+//     assert!(consumer.poll(None).is_some());
+
+//     // Expect no additional wakeups for 1s.
+//     thread::sleep(Duration::from_secs(1));
+//     assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+
+//     // Add another message, and expect a wakeup.
+//     populate_topic(&topic_name, 1, &value_fn, &key_fn, None, None).await;
+//     wait_for_wakeups(2);
+
+//     // Expect no additional wakeups for 1s.
+//     thread::sleep(Duration::from_secs(1));
+//     assert_eq!(wakeups.load(Ordering::SeqCst), 2);
+
+//     // Disable the queue and add another message.
+//     consumer.set_nonempty_callback(|| ());
+//     populate_topic(&topic_name, 1, &value_fn, &key_fn, None, None).await;
+
+//     // Expect no additional wakeups for 1s.
+//     thread::sleep(Duration::from_secs(1));
+//     assert_eq!(wakeups.load(Ordering::SeqCst), 2);
+// }
 
 #[tokio::test]
 async fn test_invalid_consumer_position() {
