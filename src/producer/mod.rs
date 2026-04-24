@@ -173,7 +173,7 @@ pub mod future_producer;
 #[doc(inline)]
 pub use self::base_producer::{BaseProducer, BaseRecord, DeliveryResult, ThreadedProducer};
 #[doc(inline)]
-pub use self::future_producer::{DeliveryFuture, FutureProducer, FutureRecord, QueuedBatch};
+pub use self::future_producer::{DeliveryFuture, FutureProducer, FutureRecord};
 
 //
 // ********** PRODUCER CONTEXT **********
