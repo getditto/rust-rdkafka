@@ -478,6 +478,44 @@ where
         results
     }
 
+    /// Synchronously enqueues a record, sending the delivery result on `tx` when done.
+    ///
+    /// **Must not** be called from async context — use `spawn_blocking`. Retries
+    /// indefinitely on [`QueueFull`][RDKafkaErrorCode::QueueFull] with a 1 ms sleep;
+    /// returns `Err` (dropping `tx`, so the receiver sees `Canceled`) on any other error.
+    pub fn send_into<K, P>(
+        &self,
+        record: FutureRecord<'_, K, P>,
+        tx: oneshot::Sender<OwnedDeliveryResult>,
+    ) -> Result<(), KafkaError>
+    where
+        K: ToBytes + ?Sized,
+        P: ToBytes + ?Sized,
+    {
+        let mut base_record = record.into_base_record(Box::new(tx));
+        let mut logged = false;
+        loop {
+            match self.producer.send(base_record) {
+                Err((e, record))
+                    if e == KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) =>
+                {
+                    if !logged {
+                        logged = true;
+                        self.context().log(
+                            RDKafkaLogLevel::Warning,
+                            "FutureProducer::send_into",
+                            "QueueFull — retrying",
+                        );
+                    }
+                    base_record = record;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(()) => return Ok(()),
+                Err((e, _record)) => return Err(e), // drops tx → receiver sees Canceled
+            }
+        }
+    }
+
     /// Like [`FutureProducer::send`], but if enqueuing fails, an error will be
     /// returned immediately, alongside the [`FutureRecord`] provided.
     #[allow(clippy::result_large_err)]

@@ -103,6 +103,23 @@ where
         })
     }
 
+    /// Interrupts any in-progress [`poll`] call on this consumer, causing it to return
+    /// immediately.
+    ///
+    /// Safe to call from another thread. Internally calls `rd_kafka_queue_yield` on the
+    /// consumer's queue, which is explicitly documented by librdkafka as usable from another
+    /// thread to cancel a blocked `rd_kafka_queue_poll()`.
+    ///
+    /// Must not be called from a signal handler as that may cause deadlocks (librdkafka
+    /// restriction).
+    ///
+    /// [`poll`]: BaseConsumer::poll
+    pub fn wakeup(&self) {
+        // SAFETY: `self.queue` is valid for the lifetime of this consumer.
+        // `rd_kafka_queue_yield` is documented as safe to call from another thread.
+        unsafe { rdsys::rd_kafka_queue_yield(self.queue.ptr()) }
+    }
+
     /// Polls the consumer for new messages.
     ///
     /// It won't block for more than the specified timeout. Use zero `Duration` for non-blocking
