@@ -478,6 +478,60 @@ where
         results
     }
 
+    /// Enqueues a single record, arranging for the delivery result to be sent on `tx`.
+    ///
+    /// This is a **synchronous** method that uses [`std::thread::sleep`] for back-off
+    /// when librdkafka's internal queue is full. It **must not** be called directly from
+    /// an async context — use [`tokio::task::spawn_blocking`] (or an equivalent
+    /// blocking-thread executor) instead, and apply a [`tokio::time::timeout`] to bound
+    /// how long the caller waits for the record to be accepted.
+    ///
+    /// On `Ok(())` the record has been accepted by librdkafka; the delivery result
+    /// (success or broker-side error) will be sent on `tx` asynchronously when the
+    /// delivery callback fires.
+    ///
+    /// On `Err(KafkaError)` the record was rejected due to a non-transient error.
+    /// `tx` is dropped in this case, so the paired receiver will see
+    /// [`oneshot::Canceled`][futures_channel::oneshot::Canceled].
+    ///
+    /// [`QueueFull`][`RDKafkaErrorCode::QueueFull`] is treated as a transient condition:
+    /// the method sleeps for 1 ms and retries indefinitely until the queue has room or a
+    /// non-transient error occurs.
+    pub fn send_into<K, P>(
+        &self,
+        record: FutureRecord<'_, K, P>,
+        tx: oneshot::Sender<OwnedDeliveryResult>,
+    ) -> Result<(), KafkaError>
+    where
+        K: ToBytes + ?Sized,
+        P: ToBytes + ?Sized,
+    {
+        let mut base_record = record.into_base_record(Box::new(tx));
+        let mut logged = false;
+        loop {
+            match self.producer.send(base_record) {
+                Err((e, record))
+                    if e == KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull) =>
+                {
+                    if !logged {
+                        logged = true;
+                        self.context().log(
+                            RDKafkaLogLevel::Warning,
+                            "FutureProducer::send_into",
+                            "QueueFull — retrying",
+                        );
+                    }
+                    base_record = record;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(()) => return Ok(()),
+                // Non-transient error: `base_record` (and the `tx` inside it) is dropped
+                // here, causing the paired receiver to see `Canceled`.
+                Err((e, _record)) => return Err(e),
+            }
+        }
+    }
+
     /// Like [`FutureProducer::send`], but if enqueuing fails, an error will be
     /// returned immediately, alongside the [`FutureRecord`] provided.
     #[allow(clippy::result_large_err)]
