@@ -478,25 +478,11 @@ where
         results
     }
 
-    /// Enqueues a single record, arranging for the delivery result to be sent on `tx`.
+    /// Synchronously enqueues a record, sending the delivery result on `tx` when done.
     ///
-    /// This is a **synchronous** method that uses [`std::thread::sleep`] for back-off
-    /// when librdkafka's internal queue is full. It **must not** be called directly from
-    /// an async context — use [`tokio::task::spawn_blocking`] (or an equivalent
-    /// blocking-thread executor) instead, and apply a [`tokio::time::timeout`] to bound
-    /// how long the caller waits for the record to be accepted.
-    ///
-    /// On `Ok(())` the record has been accepted by librdkafka; the delivery result
-    /// (success or broker-side error) will be sent on `tx` asynchronously when the
-    /// delivery callback fires.
-    ///
-    /// On `Err(KafkaError)` the record was rejected due to a non-transient error.
-    /// `tx` is dropped in this case, so the paired receiver will see
-    /// [`oneshot::Canceled`][futures_channel::oneshot::Canceled].
-    ///
-    /// [`QueueFull`][`RDKafkaErrorCode::QueueFull`] is treated as a transient condition:
-    /// the method sleeps for 1 ms and retries indefinitely until the queue has room or a
-    /// non-transient error occurs.
+    /// **Must not** be called from async context — use `spawn_blocking`. Retries
+    /// indefinitely on [`QueueFull`][RDKafkaErrorCode::QueueFull] with a 1 ms sleep;
+    /// returns `Err` (dropping `tx`, so the receiver sees `Canceled`) on any other error.
     pub fn send_into<K, P>(
         &self,
         record: FutureRecord<'_, K, P>,
@@ -525,9 +511,7 @@ where
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Ok(()) => return Ok(()),
-                // Non-transient error: `base_record` (and the `tx` inside it) is dropped
-                // here, causing the paired receiver to see `Canceled`.
-                Err((e, _record)) => return Err(e),
+                Err((e, _record)) => return Err(e), // drops tx → receiver sees Canceled
             }
         }
     }
