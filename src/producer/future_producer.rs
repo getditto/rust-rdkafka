@@ -465,7 +465,7 @@ where
         let mut results = Vec::with_capacity(rxs.len() + enqueue_err.is_some() as usize);
         for rx in rxs {
             match rx.await.expect("producer unexpectedly dropped") {
-                Ok((p, o)) => results.push(Ok((p, o))),
+                Ok(delivery) => results.push(Ok(delivery)),
                 Err((e, om)) => {
                     results.push(Err((e, om)));
                     break;
