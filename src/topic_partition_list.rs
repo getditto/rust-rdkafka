@@ -8,7 +8,6 @@ use std::fmt;
 use std::slice;
 use std::str;
 
-use libc::c_void;
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
@@ -136,22 +135,77 @@ impl<'a> TopicPartitionListElem<'a> {
         }
     }
 
-    /// Returns the optional metadata associated with the entry.
-    pub fn metadata(&self) -> &str {
-        let bytes = unsafe { util::ptr_to_slice(self.ptr.metadata, self.ptr.metadata_size) };
-        str::from_utf8(bytes).expect("Metadata is not UTF-8")
+    /// Returns the opaque consumer-offset metadata bytes.
+    pub fn metadata_bytes(&self) -> &[u8] {
+        // SAFETY: the native list owns this data for the lifetime of `&self`; empty/null data is
+        // represented as an empty slice.
+        unsafe { util::ptr_to_slice(self.ptr.metadata, self.ptr.metadata_size) }
     }
 
-    /// Sets the optional metadata associated with the entry.
+    /// Returns whether opaque consumer-offset metadata is present, along with its bytes.
+    ///
+    /// `None` is a null native pointer. `Some(&[])` is metadata present with zero length.
+    pub fn metadata_bytes_opt(&self) -> Option<&[u8]> {
+        // SAFETY: the native list owns this data for the lifetime of `&self`. A null pointer is
+        // absent; every non-null pointer is valid to read for metadata_size bytes from the parser
+        // or from the owned setter buffer.
+        unsafe { util::ptr_to_opt_slice(self.ptr.metadata, self.ptr.metadata_size) }
+    }
+
+    /// Returns the optional metadata associated with the entry.
+    ///
+    /// This legacy accessor requires UTF-8. Use [`Self::metadata_bytes`] for arbitrary consumer
+    /// metadata.
+    pub fn metadata(&self) -> &str {
+        str::from_utf8(self.metadata_bytes()).expect("Metadata is not UTF-8")
+    }
+
+    /// Sets the optional opaque metadata associated with the entry.
     pub fn set_metadata<M>(&mut self, metadata: M)
     where
-        M: AsRef<str>,
+        M: AsRef<[u8]>,
     {
-        let metadata = metadata.as_ref();
-        let buf = unsafe { libc::malloc(metadata.len()) };
-        unsafe { libc::memcpy(buf, metadata.as_ptr() as *const c_void, metadata.len()) };
-        self.ptr.metadata = buf;
-        self.ptr.metadata_size = metadata.len();
+        self.set_metadata_bytes_opt(Some(metadata.as_ref()));
+    }
+
+    /// Sets metadata while preserving the distinction between absence and present-empty bytes.
+    ///
+    /// The entry owns an independent native copy. Present-empty metadata uses an owned
+    /// allocation so its pointer remains non-null. Native `librdkafka` list copies only retain
+    /// non-empty metadata; [`TopicPartitionList::clone`] restores present-empty presence with a
+    /// separate owned allocation.
+    pub fn set_metadata_bytes_opt(&mut self, metadata: Option<&[u8]>) {
+        let buffer = match metadata {
+            Some(metadata) => {
+                // SAFETY: libc::malloc uses the allocator wrapped by librdkafka's rd_malloc. A
+                // one-byte allocation gives present-empty metadata a non-null, owned pointer.
+                let buffer = unsafe { libc::malloc(metadata.len().max(1)) };
+                assert!(
+                    !buffer.is_null(),
+                    "cannot allocate consumer-offset metadata"
+                );
+                if !metadata.is_empty() {
+                    // SAFETY: the new buffer holds exactly `metadata.len()` initialized bytes and
+                    // is independently allocated, so it cannot overlap the source slice.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            metadata.as_ptr(),
+                            buffer.cast(),
+                            metadata.len(),
+                        )
+                    };
+                }
+                buffer
+            }
+            None => std::ptr::null_mut(),
+        };
+
+        // SAFETY: the entry exclusively owns its previous metadata allocation. Both the native
+        // parser and this setter use malloc-compatible allocation, and the replacement above owns
+        // separate storage. librdkafka's destructor applies the matching free exactly once.
+        unsafe { libc::free(self.ptr.metadata) };
+        self.ptr.metadata = buffer;
+        self.ptr.metadata_size = metadata.map_or(0, <[u8]>::len);
     }
 }
 
@@ -189,7 +243,18 @@ unsafe impl KafkaDrop for RDKafkaTopicPartitionList {
 impl Clone for TopicPartitionList {
     fn clone(&self) -> Self {
         let new_tpl = unsafe { rdsys::rd_kafka_topic_partition_list_copy(self.ptr()) };
-        unsafe { TopicPartitionList::from_ptr(new_tpl) }
+        let cloned = unsafe { TopicPartitionList::from_ptr(new_tpl) };
+        // SAFETY: both live lists own element arrays valid for their respective counts. Native
+        // copy duplicates every element, so these arrays have equal lengths and disjoint storage.
+        let source = unsafe { slice::from_raw_parts((*self.ptr()).elems, self.count()) };
+        let destination =
+            unsafe { slice::from_raw_parts_mut((*cloned.ptr()).elems, cloned.count()) };
+        for (source, destination) in source.iter().zip(destination) {
+            if !source.metadata.is_null() && source.metadata_size == 0 {
+                TopicPartitionListElem { ptr: destination }.set_metadata_bytes_opt(Some(&[]));
+            }
+        }
+        cloned
     }
 }
 
@@ -497,6 +562,79 @@ mod tests {
 
         let tp = tpl.find_partition("topic1", 0).unwrap();
         assert_eq!(tp.offset(), Offset::Invalid);
+    }
+
+    #[test]
+    fn opaque_metadata_bytes_are_copied_and_survive_native_clone() {
+        let expected = b"migration\x00\xff";
+        let mut source = expected.to_vec();
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition("topic1", 0)
+            .set_metadata_bytes_opt(Some(&source));
+        source.fill(0);
+
+        assert_eq!(
+            tpl.find_partition("topic1", 0)
+                .unwrap()
+                .metadata_bytes_opt(),
+            Some(expected.as_slice())
+        );
+
+        let cloned = tpl.clone();
+        drop(tpl);
+
+        assert_eq!(
+            cloned
+                .find_partition("topic1", 0)
+                .unwrap()
+                .metadata_bytes_opt(),
+            Some(expected.as_slice())
+        );
+    }
+
+    #[test]
+    fn absent_metadata_survives_replacement_and_native_clone() {
+        let mut tpl = TopicPartitionList::new();
+        let mut entry = tpl.add_partition("topic1", 0);
+        assert_eq!(entry.metadata_bytes_opt(), None);
+
+        entry.set_metadata_bytes_opt(Some(b"discard me"));
+        entry.set_metadata_bytes_opt(None);
+        assert_eq!(entry.metadata_bytes_opt(), None);
+
+        let cloned = tpl.clone();
+        drop(tpl);
+        assert_eq!(
+            cloned
+                .find_partition("topic1", 0)
+                .unwrap()
+                .metadata_bytes_opt(),
+            None
+        );
+    }
+
+    #[test]
+    fn present_empty_metadata_survives_native_clone() {
+        let mut tpl = TopicPartitionList::new();
+        tpl.add_partition("topic1", 0)
+            .set_metadata_bytes_opt(Some(b""));
+        assert_eq!(
+            tpl.find_partition("topic1", 0)
+                .unwrap()
+                .metadata_bytes_opt(),
+            Some(b"".as_slice())
+        );
+
+        let cloned = tpl.clone();
+        drop(tpl);
+
+        assert_eq!(
+            cloned
+                .find_partition("topic1", 0)
+                .unwrap()
+                .metadata_bytes_opt(),
+            Some(b"".as_slice())
+        );
     }
 
     #[test]

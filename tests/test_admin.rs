@@ -5,8 +5,9 @@ use std::time::Duration;
 use backon::{BlockingRetryable, ExponentialBuilder};
 
 use rdkafka::admin::{
-    AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigSource, GroupResult, NewPartitions,
-    NewTopic, OwnedResourceSpecifier, ResourceSpecifier, TopicReplication,
+    AdminClient, AdminOptions, AlterConfig, ConfigEntry, ConfigResource, ConfigSource,
+    ConsumerGroupOffsetsUpdate, GroupResult, IncrementalAlterConfig, NewPartitions, NewTopic,
+    OwnedResourceSpecifier, ResourceSpecifier, TopicReplication,
 };
 use rdkafka::client::DefaultClientContext;
 use rdkafka::consumer::{BaseConsumer, CommitMode, Consumer, DefaultConsumerContext};
@@ -627,4 +628,119 @@ async fn test_event_errors() {
         res,
         Err(KafkaError::AdminOp(RDKafkaErrorCode::OperationTimedOut))
     );
+}
+
+async fn read_topic_config(
+    admin: &AdminClient<DefaultClientContext>,
+    topic: &str,
+) -> ConfigResource {
+    let request = [ResourceSpecifier::Topic(topic)];
+    admin
+        .describe_configs(&request, &AdminOptions::default())
+        .await
+        .expect("read topic config")
+        .pop()
+        .expect("one topic result")
+        .expect("topic config result")
+}
+
+#[tokio::test]
+async fn test_incremental_config_and_opaque_group_metadata() {
+    let admin = create_admin_client();
+    let topic = rand_test_topic("incremental");
+    let opts = AdminOptions::new().operation_timeout(Some(Duration::from_secs(10)));
+    admin
+        .create_topics(
+            &[NewTopic::new(&topic, 1, TopicReplication::Fixed(1))
+                .set("retention.ms", "123456")
+                .set("retention.bytes", "654321")],
+            &opts,
+        )
+        .await
+        .expect("create test topic");
+
+    let change =
+        IncrementalAlterConfig::new(ResourceSpecifier::Topic(&topic)).set("retention.ms", "567890");
+    let changed = admin.incremental_alter_configs([&change], &opts).await;
+    assert_eq!(
+        changed,
+        Ok(vec![Ok(OwnedResourceSpecifier::Topic(topic.clone()))])
+    );
+
+    let changed = read_topic_config(&admin, &topic).await;
+    let entries = changed.entry_map();
+    assert_eq!(
+        entries["retention.ms"].value.clone().as_deref().unwrap(),
+        "567890"
+    );
+    assert_eq!(
+        entries["retention.bytes"].value.clone().as_deref().unwrap(),
+        "654321"
+    );
+
+    // Delete a topic override and repeat the operation, preserving the unrelated override.
+    let change =
+        IncrementalAlterConfig::new(ResourceSpecifier::Topic(&topic)).delete("retention.ms");
+    for _ in 0..2 {
+        let result = admin
+            .incremental_alter_configs([&change], &opts)
+            .await
+            .expect("delete topic config override");
+        assert_eq!(result[0], Ok(OwnedResourceSpecifier::Topic(topic.clone())));
+    }
+    let described = read_topic_config(&admin, &topic).await;
+    let entries = described.entry_map();
+    let entry = entries["retention.ms"];
+    assert_ne!(entry.source, ConfigSource::DynamicTopic);
+    assert_eq!(entry.value.clone().as_deref(), Some("604800000"));
+    assert_eq!(
+        entries["retention.bytes"].value.clone().as_deref().unwrap(),
+        "654321"
+    );
+
+    let group = rand_test_topic("opaque-group");
+    // Kafka's OffsetCommit metadata is a UTF-8 string, including on the read-back path.
+    let opaque = b"migration-\xc3\xbf";
+    let mut offsets = TopicPartitionList::new();
+    offsets
+        .add_partition_offset(&topic, 0, Offset::Offset(7))
+        .unwrap();
+    offsets
+        .find_partition(&topic, 0)
+        .unwrap()
+        .set_metadata(opaque);
+    let update = ConsumerGroupOffsetsUpdate {
+        group: &group,
+        offsets: &offsets,
+    };
+    let mut results = admin
+        .alter_consumer_group_offsets([&update], &opts)
+        .await
+        .expect("alter consumer group offsets");
+    let result = results.pop().expect("one group result");
+    assert_eq!(result.group, group);
+    let returned = result.result.expect("group-level success");
+    for partition in returned.elements() {
+        partition.error().expect("partition-level success");
+    }
+    assert_eq!(returned.elements()[0].metadata_bytes(), opaque);
+
+    let consumer: BaseConsumer = create_config()
+        .set("group.id", &group)
+        .create()
+        .expect("create offset reader");
+    let fetched = consumer
+        .committed_offsets(offsets, Duration::from_secs(10))
+        .expect("read back opaque offsets");
+    let partition = fetched.find_partition(&topic, 0).unwrap();
+    assert_eq!(partition.offset(), Offset::Offset(7));
+    // Validate explicitly instead of using the legacy panicking UTF-8 accessor.
+    let metadata = std::str::from_utf8(partition.metadata_bytes())
+        .expect("broker returned invalid UTF-8 metadata");
+    assert_eq!(metadata.as_bytes(), opaque);
+
+    admin
+        .delete_topics(&[&topic], &opts)
+        .await
+        .expect("delete test topic");
 }

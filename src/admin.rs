@@ -19,11 +19,12 @@ use futures_util::future::{self, Either, FutureExt};
 use futures_util::ready;
 
 use rdkafka_sys as rdsys;
+use rdkafka_sys::rd_kafka_AlterConfigOpType_t;
 use rdkafka_sys::types::*;
 
 use crate::client::{Client, ClientContext, DefaultClientContext, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
-use crate::error::{IsError, KafkaError, KafkaResult};
+use crate::error::{IsError, KafkaError, KafkaResult, RDKafkaError};
 use crate::log::{trace, warn};
 use crate::util::{cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout};
 use crate::TopicPartitionList;
@@ -370,6 +371,104 @@ impl<C: ClientContext> AdminClient<C> {
                 self.client.native_ptr(),
                 native_configs.as_c_array(),
                 native_configs.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            );
+        }
+        Ok(rx)
+    }
+
+    /// Incrementally sets or deletes configuration entries without resetting
+    /// unspecified entries. The operation is not transactional across resources.
+    pub fn incremental_alter_configs<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<AlterConfigsResult>>>
+    where
+        I: IntoIterator<Item = &'a IncrementalAlterConfig<'a>>,
+    {
+        match self.incremental_alter_configs_inner(configs, opts) {
+            Ok(rx) => Either::Left(IncrementalAlterConfigsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn incremental_alter_configs_inner<'a, I>(
+        &self,
+        configs: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>>
+    where
+        I: IntoIterator<Item = &'a IncrementalAlterConfig<'a>>,
+    {
+        let mut native_configs = Vec::new();
+        let mut err_buf = ErrBuf::new();
+        for config in configs {
+            native_configs.push(config.to_native()?);
+        }
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        // SAFETY: all request objects outlive the enqueue and the response is sent on `queue`.
+        unsafe {
+            rdsys::rd_kafka_IncrementalAlterConfigs(
+                self.client.native_ptr(),
+                native_configs.as_c_array(),
+                native_configs.len(),
+                native_opts.ptr(),
+                self.queue.ptr(),
+            );
+        }
+        Ok(rx)
+    }
+
+    /// Alters committed consumer offsets. Group errors and per-partition errors
+    /// are returned separately; both must be inspected before treating a request as successful.
+    pub fn alter_consumer_group_offsets<'a, I>(
+        &self,
+        updates: I,
+        opts: &AdminOptions,
+    ) -> impl Future<Output = KafkaResult<Vec<ConsumerGroupOffsetsResult>>>
+    where
+        I: IntoIterator<Item = &'a ConsumerGroupOffsetsUpdate<'a>>,
+    {
+        match self.alter_consumer_group_offsets_inner(updates, opts) {
+            Ok(rx) => Either::Left(AlterConsumerGroupOffsetsFuture { rx }),
+            Err(err) => Either::Right(future::err(err)),
+        }
+    }
+
+    fn alter_consumer_group_offsets_inner<'a, I>(
+        &self,
+        updates: I,
+        opts: &AdminOptions,
+    ) -> KafkaResult<oneshot::Receiver<NativeEvent>>
+    where
+        I: IntoIterator<Item = &'a ConsumerGroupOffsetsUpdate<'a>>,
+    {
+        let mut native_updates = Vec::new();
+        let mut err_buf = ErrBuf::new();
+        for update in updates {
+            let group = CString::new(update.group)?;
+            // SAFETY: a valid constructed group-offset request owns its supplied offset data.
+            let update = unsafe {
+                NativeAlterConsumerGroupOffsets::from_ptr(
+                    rdsys::rd_kafka_AlterConsumerGroupOffsets_new(
+                        group.as_ptr(),
+                        update.offsets.ptr(),
+                    ),
+                )
+                .unwrap()
+            };
+            native_updates.push(update);
+        }
+        let (native_opts, rx) = opts.to_native(self.client.native_ptr(), &mut err_buf)?;
+        // SAFETY: librdkafka copies each request for asynchronous use; `native_updates`
+        // remains alive for this call and destroys the original requests afterwards.
+        unsafe {
+            rdsys::rd_kafka_AlterConsumerGroupOffsets(
+                self.client.native_ptr(),
+                native_updates.as_c_array(),
+                native_updates.len(),
                 native_opts.ptr(),
                 self.queue.ptr(),
             );
@@ -1309,6 +1408,206 @@ impl<'a> AlterConfig<'a> {
             check_rdkafka_invalid_arg(res, err_buf)?;
         }
         Ok(config)
+    }
+}
+
+/// One resource's incremental configuration changes. Unlisted entries stay unchanged.
+#[derive(Debug)]
+pub struct IncrementalAlterConfig<'a> {
+    /// Resource being changed.
+    pub specifier: ResourceSpecifier<'a>,
+    /// `Some(value)` is SET; `None` is DELETE.
+    pub entries: HashMap<&'a str, Option<&'a str>>,
+}
+
+impl<'a> IncrementalAlterConfig<'a> {
+    /// Creates an empty incremental configuration request.
+    pub fn new(specifier: ResourceSpecifier<'a>) -> Self {
+        Self {
+            specifier,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Sets one key without resetting unspecified keys.
+    pub fn set(mut self, key: &'a str, value: &'a str) -> Self {
+        self.entries.insert(key, Some(value));
+        self
+    }
+
+    /// Deletes one topic-level override, restoring the broker default.
+    pub fn delete(mut self, key: &'a str) -> Self {
+        self.entries.insert(key, None);
+        self
+    }
+
+    fn to_native(&self) -> KafkaResult<NativeConfigResource> {
+        let (name, typ) = match self.specifier {
+            ResourceSpecifier::Topic(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_TOPIC,
+            ),
+            ResourceSpecifier::Group(name) => (
+                CString::new(name)?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_GROUP,
+            ),
+            ResourceSpecifier::Broker(id) => (
+                CString::new(id.to_string())?,
+                RDKafkaResourceType::RD_KAFKA_RESOURCE_BROKER,
+            ),
+        };
+        // SAFETY: `name` is NUL-terminated and the native resource is checked before use.
+        let config = unsafe {
+            NativeConfigResource::from_ptr(rdsys::rd_kafka_ConfigResource_new(typ, name.as_ptr()))
+                .expect("librdkafka can allocate a config resource")
+        };
+        for (key, value) in &self.entries {
+            let key_c = CString::new(*key)?;
+            let value_c = value.map(CString::new).transpose()?;
+            let value_ptr = value_c
+                .as_ref()
+                .map_or(std::ptr::null(), |value| value.as_ptr());
+            let operation = if value.is_some() {
+                rd_kafka_AlterConfigOpType_t::RD_KAFKA_ALTER_CONFIG_OP_TYPE_SET
+            } else {
+                rd_kafka_AlterConfigOpType_t::RD_KAFKA_ALTER_CONFIG_OP_TYPE_DELETE
+            };
+            // SAFETY: all strings remain valid during this synchronous request construction.
+            // An error object, when present, is owned by the Rust wrapper and destroyed on drop.
+            let error = unsafe {
+                RDKafkaError::from_ptr(rdsys::rd_kafka_ConfigResource_add_incremental_config(
+                    config.ptr(),
+                    key_c.as_ptr(),
+                    operation,
+                    value_ptr,
+                ))
+            };
+            if error.is_error() {
+                return Err(KafkaError::AdminOpCreation(error.to_string()));
+            }
+        }
+        Ok(config)
+    }
+}
+
+struct IncrementalAlterConfigsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for IncrementalAlterConfigsFuture {
+    type Output = KafkaResult<Vec<AlterConfigsResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        // SAFETY: the event is a valid incremental-config response and outlives extraction.
+        let result = unsafe { rdsys::rd_kafka_event_IncrementalAlterConfigs_result(event.ptr()) };
+        if result.is_null() {
+            // SAFETY: a valid event can report its native type.
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "incremental alter configs received response of incorrect type ({typ})"
+            ))));
+        }
+        // SAFETY: `result` remains alive for this entire owned-result conversion.
+        let mut count = 0;
+        let resources =
+            unsafe { rdsys::rd_kafka_IncrementalAlterConfigs_result_resources(result, &mut count) };
+        let mut output = Vec::with_capacity(count);
+        for index in 0..count {
+            // SAFETY: the native result exposes exactly `count` resource pointers.
+            let resource = unsafe { *resources.add(index) };
+            let specifier = extract_config_specifier(resource)?;
+            // SAFETY: `resource` is from a completed response.
+            let error = unsafe { rdsys::rd_kafka_ConfigResource_error(resource) };
+            if error.is_error() {
+                output.push(Err((specifier, error.into())));
+            } else {
+                output.push(Ok(specifier));
+            }
+        }
+        Poll::Ready(Ok(output))
+    }
+}
+
+/// A request to alter one group's committed offsets and opaque metadata.
+pub struct ConsumerGroupOffsetsUpdate<'a> {
+    /// Consumer group identifier.
+    pub group: &'a str,
+    /// Partition offsets and metadata to commit.
+    pub offsets: &'a TopicPartitionList,
+}
+
+/// One group's mutation response. Per-partition errors remain in the offsets list.
+pub struct ConsumerGroupOffsetsResult {
+    /// Group that produced this result.
+    pub group: String,
+    /// Group-level error, or the owned per-partition response list.
+    pub result: Result<TopicPartitionList, RDKafkaErrorCode>,
+}
+
+type NativeAlterConsumerGroupOffsets = NativePtr<RDKafkaAlterConsumerGroupOffsets>;
+
+unsafe impl KafkaDrop for RDKafkaAlterConsumerGroupOffsets {
+    const TYPE: &'static str = "consumer-group offsets";
+    const DROP: unsafe extern "C" fn(*mut Self) = rdsys::rd_kafka_AlterConsumerGroupOffsets_destroy;
+}
+
+struct AlterConsumerGroupOffsetsFuture {
+    rx: oneshot::Receiver<NativeEvent>,
+}
+
+impl Future for AlterConsumerGroupOffsetsFuture {
+    type Output = KafkaResult<Vec<ConsumerGroupOffsetsResult>>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let event = ready!(self.rx.poll_unpin(cx)).map_err(|_| KafkaError::Canceled)?;
+        event.check_error()?;
+        // SAFETY: the caller has checked the event and its result is alive for extraction.
+        let result = unsafe { rdsys::rd_kafka_event_AlterConsumerGroupOffsets_result(event.ptr()) };
+        if result.is_null() {
+            // SAFETY: a valid event can report its native type.
+            let typ = unsafe { rdsys::rd_kafka_event_type(event.ptr()) };
+            return Poll::Ready(Err(KafkaError::AdminOpCreation(format!(
+                "alter consumer-group offsets received response of incorrect type ({typ})"
+            ))));
+        }
+        let mut count = 0;
+        // SAFETY: a successful response contains exactly `count` group pointers.
+        let groups =
+            unsafe { rdsys::rd_kafka_AlterConsumerGroupOffsets_result_groups(result, &mut count) };
+        let mut output = Vec::with_capacity(count);
+        for index in 0..count {
+            // SAFETY: each index belongs to this completed response.
+            let group = unsafe { *groups.add(index) };
+            // SAFETY: a group's name is a valid native NUL-terminated string.
+            let name = unsafe { cstr_to_owned(rdsys::rd_kafka_group_result_name(group)) };
+            // SAFETY: a group error pointer is valid for the response duration.
+            let error = unsafe {
+                let error = rdsys::rd_kafka_group_result_error(group);
+                rdsys::rd_kafka_error_code(error)
+            };
+            let result = if error.is_error() {
+                Err(error.into())
+            } else {
+                // SAFETY: group result offsets are cloned into independently owned storage.
+                Ok(unsafe {
+                    let offsets = rdsys::rd_kafka_group_result_partitions(group);
+                    if offsets.is_null() {
+                        TopicPartitionList::new()
+                    } else {
+                        TopicPartitionList::from_ptr(rdsys::rd_kafka_topic_partition_list_copy(
+                            offsets,
+                        ))
+                    }
+                })
+            };
+            output.push(ConsumerGroupOffsetsResult {
+                group: name,
+                result,
+            });
+        }
+        Poll::Ready(Ok(output))
     }
 }
 

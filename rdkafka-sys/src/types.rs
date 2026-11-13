@@ -93,6 +93,9 @@ pub type RDKafkaAdminOptions = bindings::rd_kafka_AdminOptions_t;
 /// Native rdkafka topic result.
 pub type RDKafkaTopicResult = bindings::rd_kafka_topic_result_t;
 
+/// Native rdkafka consumer-group offsets alteration request.
+pub type RDKafkaAlterConsumerGroupOffsets = bindings::rd_kafka_AlterConsumerGroupOffsets_t;
+
 /// Native rdkafka group result.
 pub type RDKafkaGroupResult = bindings::rd_kafka_group_result_t;
 
