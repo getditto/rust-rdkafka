@@ -167,6 +167,30 @@ where
         }
     }
 
+    /// Delays or fails the next matching request on one broker, including successful responses.
+    pub fn push_request_error_rtt(
+        &self,
+        broker_id: i32,
+        api_key: RDKafkaApiKey,
+        error: RDKafkaRespErr,
+        delay: Duration,
+    ) -> KafkaResult<()> {
+        let delay_ms = delay.as_millis().try_into().unwrap_or(c_int::MAX);
+        // SAFETY: the cluster is alive for `self`; C variadic enum promotion uses `c_int`.
+        return_mock_op! {
+            unsafe {
+                rdsys::rd_kafka_mock_broker_push_request_error_rtts(
+                    self.mock_cluster,
+                    broker_id,
+                    api_key.into(),
+                    1,
+                    error as c_int,
+                    delay_ms,
+                )
+            }
+        }
+    }
+
     /// Set the topic error to return in protocol requests.
     ///
     /// Currently only used for TopicMetadataRequest and AddPartitionsToTxnRequest.
