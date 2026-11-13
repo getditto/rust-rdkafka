@@ -7,7 +7,10 @@ use std::slice;
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
-use crate::util::{KafkaDrop, NativePtr};
+use crate::{
+    error::{IsError, KafkaError, KafkaResult},
+    util::{KafkaDrop, NativePtr},
+};
 
 /// Group member information container.
 pub struct GroupMemberInfo(RDKafkaGroupMemberInfo);
@@ -79,6 +82,15 @@ impl GroupInfo {
             CStr::from_ptr(self.0.group)
                 .to_str()
                 .expect("Group name is not a valid UTF-8 string")
+        }
+    }
+
+    /// Returns a group description error, if one occurred.
+    pub fn error(&self) -> KafkaResult<()> {
+        if self.0.err.is_error() {
+            Err(KafkaError::GroupListFetch(self.0.err.into()))
+        } else {
+            Ok(())
         }
     }
 
@@ -154,6 +166,25 @@ impl GroupList {
     pub fn groups(&self) -> &[GroupInfo] {
         unsafe {
             slice::from_raw_parts(self.0.groups as *const GroupInfo, self.0.group_cnt as usize)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn group_description_error_is_exposed() {
+        // SAFETY: the C struct contains only plain scalars and nullable pointers; GroupInfo does not
+        // free or own them. The accessor-only test never dereferences these null pointers.
+        let mut raw: RDKafkaGroupInfo = unsafe { std::mem::zeroed() };
+        raw.err = RDKafkaRespErr::RD_KAFKA_RESP_ERR_COORDINATOR_NOT_AVAILABLE;
+        match GroupInfo(raw).error() {
+            Err(KafkaError::GroupListFetch(code)) => {
+                assert_ne!(code, RDKafkaErrorCode::NoError);
+            }
+            other => panic!("expected a group-description error, got {other:?}"),
         }
     }
 }
